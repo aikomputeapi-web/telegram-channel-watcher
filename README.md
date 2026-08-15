@@ -40,6 +40,11 @@ New posts and edits are both watched. If Telegram adds the archive or the
 `.pass:` caption in a later edit, the watcher leaves the post pending and
 processes the completed version.
 
+Posts may also contain an allowlisted Telegram bot deep link such as
+`https://t.me/boxedrobot?start=MTg2NA==`. The watcher sends the equivalent
+`/start MTg2NA==` command to that bot, waits for its document, then downloads
+and extracts it using the `.pass:` value from the original channel post.
+
 ## What you get
 
 - `downloads/<msg_id>_<archive name>/…` — extracted contents
@@ -58,6 +63,8 @@ processes the completed version.
 | `DOWNLOAD_DIR` | `downloads` | where files land |
 | `BACKFILL_HOURS` | `24` | one-time catch-up window on first run |
 | `SWEEP_HOURS` | `2` | catch-up window checked on every start |
+| `DOWNLOAD_BOTS` | `boxedrobot` | comma-separated bot usernames whose `?start=` links may be followed |
+| `BOT_RESPONSE_TIMEOUT` | `120` | seconds to wait for a download bot's document |
 | `SEVENZIP` | auto | explicit path to `7z`/`7zz` if auto-detection fails |
 
 ## Deploying to a VPS
@@ -91,8 +98,8 @@ you use the numeric channel id or @username.
   albums (multiple files grouped under one caption) only the message that
   actually carries the caption text is processed.
 - Telegram's normal cloud download icon does not need to be clicked first;
-  Telethon downloads the document directly. Inline bot buttons are not clicked
-  automatically.
+  Telethon downloads the document directly. Only `?start=` links for bots in
+  `DOWNLOAD_BOTS` are followed; other inline buttons are ignored.
 - Zip (standard + AES-256) extraction is pure Python (`pyzipper`); `.7z`/`.rar`
   need the 7-Zip binary (auto-detected: `7zz`/`7z`/`7za`/Program Files, or set
   `SEVENZIP`).

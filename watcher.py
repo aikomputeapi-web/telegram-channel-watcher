@@ -16,6 +16,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -35,6 +37,12 @@ STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 BACKFILL_HOURS = float(os.getenv("BACKFILL_HOURS", "24"))
 SWEEP_HOURS = float(os.getenv("SWEEP_HOURS", "2"))
+DOWNLOAD_BOTS = {
+    name.strip().lstrip("@").lower()
+    for name in os.getenv("DOWNLOAD_BOTS", "boxedrobot").split(",")
+    if name.strip()
+}
+BOT_RESPONSE_TIMEOUT = float(os.getenv("BOT_RESPONSE_TIMEOUT", "120"))
 MAX_STATE = 20000
 
 log = logging.getLogger("watcher")
@@ -84,25 +92,79 @@ async def resolve_entity(client: TelegramClient, ref):
     raise SystemExit(f"Could not resolve channel '{ref}'. Run make_session.py to list your channels.")
 
 
-async def process_message(client: TelegramClient, msg, processed: set) -> None:
-    if msg.id in processed or not msg.document:
-        return
+def document_name(msg):
     fname = msg.file.name if msg.file else None
     if not fname:
-        return
+        return None
     fname = Path(fname).name
-    if not is_supported_archive(fname):
+    return fname if is_supported_archive(fname) else None
+
+
+def bot_deep_link(msg):
+    for row in getattr(msg, "buttons", None) or []:
+        for button in row:
+            url = getattr(button, "url", None)
+            if not url:
+                continue
+            parsed = urlparse(url)
+            if parsed.hostname not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+                continue
+            bot = parsed.path.strip("/").split("/", 1)[0].lstrip("@").lower()
+            payload = parse_qs(parsed.query).get("start", [None])[0]
+            if bot in DOWNLOAD_BOTS and payload:
+                return bot, payload
+    return None
+
+
+async def request_bot_document(client: TelegramClient, bot: str, payload: str, lock: asyncio.Lock):
+    log.info("requesting file from @%s", bot)
+    async with lock:
+        deadline = monotonic() + BOT_RESPONSE_TIMEOUT
+        async with client.conversation(bot, timeout=BOT_RESPONSE_TIMEOUT, exclusive=True) as conv:
+            await conv.send_message(f"/start {payload}")
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                response = await asyncio.wait_for(conv.get_response(), timeout=remaining)
+                if response.document:
+                    return response
+
+
+async def process_message(client: TelegramClient, msg, processed: set, bot_lock: asyncio.Lock) -> None:
+    if msg.id in processed:
+        return
+
+    source = msg
+    fname = document_name(source) if source.document else None
+    deep_link = None if fname else bot_deep_link(msg)
+    if not fname and not deep_link:
         return
 
     candidates = password_candidates(getattr(msg, "message", "") or "")
     if not candidates:
-        log.warning("msg %d (%s): no '.pass:' line found in post - skipping", msg.id, fname)
+        log.warning("msg %d: no '.pass:' line found in post - leaving pending", msg.id)
         return
+
+    if deep_link:
+        bot, payload = deep_link
+        try:
+            source = await request_bot_document(client, bot, payload, bot_lock)
+        except asyncio.TimeoutError:
+            log.error("msg %d: timed out waiting for @%s to return a file", msg.id, bot)
+            return
+        except Exception as e:
+            log.error("msg %d: @%s file request failed: %s", msg.id, bot, e)
+            return
+        fname = document_name(source)
+        if not fname:
+            log.error("msg %d: @%s returned an unsupported or unnamed document", msg.id, bot)
+            return
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     target = DOWNLOAD_DIR / f"{msg.id}_{fname}"
     if not (target.exists() and target.stat().st_size > 0):
-        size_mb = (msg.document.size or 0) / 1e6
+        size_mb = (source.document.size or 0) / 1e6
         log.info("msg %d: downloading %s (%.1f MB)", msg.id, fname, size_mb)
         last = {"pct": -1}
 
@@ -112,7 +174,7 @@ async def process_message(client: TelegramClient, msg, processed: set) -> None:
                 last["pct"] = pct
                 log.info("msg %d: %d%% (%.1f/%.1f MB)", msg.id, pct, cur / 1e6, total / 1e6)
 
-        downloaded = await client.download_media(msg, file=str(target), progress_callback=progress)
+        downloaded = await client.download_media(source, file=str(target), progress_callback=progress)
         if not downloaded or not target.exists() or target.stat().st_size == 0:
             target.unlink(missing_ok=True)
             log.error("msg %d: Telegram did not return file data; leaving it pending for retry", msg.id)
@@ -131,11 +193,12 @@ async def process_message(client: TelegramClient, msg, processed: set) -> None:
     save_state(processed)
 
 
-async def catch_up(client: TelegramClient, entity, hours: float, processed: set, label: str) -> None:
+async def catch_up(client: TelegramClient, entity, hours: float, processed: set,
+                   bot_lock: asyncio.Lock, label: str) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     log.info("%s: processing posts newer than %s UTC", label, cutoff.strftime("%Y-%m-%d %H:%M"))
     async for msg in client.iter_messages(entity, offset_date=cutoff, reverse=True):
-        await process_message(client, msg, processed)
+        await process_message(client, msg, processed, bot_lock)
     log.info("%s: done", label)
 
 
@@ -153,21 +216,22 @@ async def run(args) -> None:
     title = getattr(entity, "title", None) or CHANNEL
 
     processed = load_state()
+    bot_lock = asyncio.Lock()
     fresh = not STATE_FILE.exists()
     log.info("watching channel: %s | downloads -> %s", title, DOWNLOAD_DIR.resolve())
 
     backfill = args.backfill_hours if args.backfill_hours is not None else (BACKFILL_HOURS if fresh else 0)
     if backfill > 0:
-        await catch_up(client, entity, backfill, processed, "backfill")
+        await catch_up(client, entity, backfill, processed, bot_lock, "backfill")
 
     sweep = args.sweep_hours if args.sweep_hours is not None else SWEEP_HOURS
     if sweep > 0:
-        await catch_up(client, entity, sweep, processed, "sweep")
+        await catch_up(client, entity, sweep, processed, bot_lock, "sweep")
 
     @client.on(events.NewMessage(chats=entity))
     @client.on(events.MessageEdited(chats=entity))
     async def on_message(event):
-        await process_message(client, event.message, processed)
+        await process_message(client, event.message, processed, bot_lock)
 
     log.info("live: waiting for new or edited posts (Ctrl+C to stop)")
     await client.run_until_disconnected()
