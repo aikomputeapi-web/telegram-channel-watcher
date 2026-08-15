@@ -36,6 +36,10 @@ On the first run it backfills the last **24 h** of posts (`BACKFILL_HOURS`),
 then watches live. On every later start it re-checks the last **2 h**
 (`SWEEP_HOURS`) to catch anything posted while it was down.
 
+New posts and edits are both watched. If Telegram adds the archive or the
+`.pass:` caption in a later edit, the watcher leaves the post pending and
+processes the completed version.
+
 ## What you get
 
 - `downloads/<msg_id>_<archive name>/…` — extracted contents
@@ -86,6 +90,9 @@ you use the numeric channel id or @username.
 - The `.pass:` line must be in the **same message** as the file. For Telegram
   albums (multiple files grouped under one caption) only the message that
   actually carries the caption text is processed.
+- Telegram's normal cloud download icon does not need to be clicked first;
+  Telethon downloads the document directly. Inline bot buttons are not clicked
+  automatically.
 - Zip (standard + AES-256) extraction is pure Python (`pyzipper`); `.7z`/`.rar`
   need the 7-Zip binary (auto-detected: `7zz`/`7z`/`7za`/Program Files, or set
   `SEVENZIP`).

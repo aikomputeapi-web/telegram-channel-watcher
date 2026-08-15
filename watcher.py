@@ -97,8 +97,6 @@ async def process_message(client: TelegramClient, msg, processed: set) -> None:
     candidates = password_candidates(getattr(msg, "message", "") or "")
     if not candidates:
         log.warning("msg %d (%s): no '.pass:' line found in post - skipping", msg.id, fname)
-        processed.add(msg.id)
-        save_state(processed)
         return
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,7 +112,11 @@ async def process_message(client: TelegramClient, msg, processed: set) -> None:
                 last["pct"] = pct
                 log.info("msg %d: %d%% (%.1f/%.1f MB)", msg.id, pct, cur / 1e6, total / 1e6)
 
-        await client.download_media(msg, file=str(target), progress_callback=progress)
+        downloaded = await client.download_media(msg, file=str(target), progress_callback=progress)
+        if not downloaded or not target.exists() or target.stat().st_size == 0:
+            target.unlink(missing_ok=True)
+            log.error("msg %d: Telegram did not return file data; leaving it pending for retry", msg.id)
+            return
 
     dest = DOWNLOAD_DIR / f"{msg.id}_{Path(fname).stem}"
     try:
@@ -163,10 +165,11 @@ async def run(args) -> None:
         await catch_up(client, entity, sweep, processed, "sweep")
 
     @client.on(events.NewMessage(chats=entity))
-    async def on_new(event):
+    @client.on(events.MessageEdited(chats=entity))
+    async def on_message(event):
         await process_message(client, event.message, processed)
 
-    log.info("live: waiting for new posts (Ctrl+C to stop)")
+    log.info("live: waiting for new or edited posts (Ctrl+C to stop)")
     await client.run_until_disconnected()
 
 
