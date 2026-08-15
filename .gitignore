@@ -1,0 +1,13 @@
+.env
+.venv/
+downloads/
+state.json
+*.session
+*.session-journal
+__pycache__/
+test_tmp/
+desktop.ini
+.vscode/
+
+# gstack (global install)
+.amazonq/rules/gstack.md

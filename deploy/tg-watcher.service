@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram channel watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-watcher
+EnvironmentFile=/opt/tg-watcher/.env
+ExecStart=/opt/tg-watcher/.venv/bin/python -u watcher.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
