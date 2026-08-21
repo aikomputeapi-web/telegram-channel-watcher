@@ -8,6 +8,11 @@ __pycache__/
 test_tmp/
 desktop.ini
 .vscode/
+deploy-secrets.ps1
+
+# runtime logs + ad-hoc VPS diagnostic scripts
+.logs/
+_vps_*
 
 # gstack (global install)
 .amazonq/rules/gstack.md

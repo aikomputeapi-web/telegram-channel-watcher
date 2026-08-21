@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from watcher import bot_deep_link, document_name, request_bot_document
+from watcher import _dir_metrics, bot_deep_link, document_name, request_bot_document
 
 
 def message_with_url(url: str):
@@ -64,6 +64,19 @@ def main() -> None:
     assert document_name(archive) == "pack.ZIP"
     assert document_name(unnamed) is None
     assert document_name(unsupported) is None
+
+    # _dir_metrics sums bytes + counts files under a root
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.txt").write_text("x" * 100)
+        sub = root / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_text("y" * 50)
+        (sub / "c.bin").write_bytes(b"z" * 10)
+        total, count = _dir_metrics(root)
+        assert (total, count) == (160, 3)
 
     asyncio.run(test_bot_request())
 
