@@ -1,0 +1,20 @@
+[Unit]
+Description=Credential Search Server (Flask)
+After=network.target
+
+[Service]
+Type=simple
+User=azureuser
+Environment=CREDDB_DB_PATH=/tmp/vps_db_merge2.db
+Environment=CREDDB_WEB_ADMIN_USER=admin
+Environment=CREDDB_WEB_ADMIN_PASS=Dirty2020!
+Environment=CREDDB_SECRET_KEY=cred-search-prod-key-2026-freetier
+Environment=CREDDB_PORT=8081
+Environment=PYTHONPATH=/tmp
+WorkingDirectory=/tmp
+ExecStart=/usr/bin/python3 -u /tmp/search_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

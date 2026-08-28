@@ -17,7 +17,9 @@ from pathlib import Path
 from flask import Flask, request, redirect, url_for, session, render_template_string, g
 
 app = Flask(__name__)
-app.secret_key = os.urandom(32)
+app.secret_key = os.getenv("CREDDB_SECRET_KEY", "cred-search-static-key-2026")
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"] = True
 
 DB_PATH = Path(os.getenv("CREDDB_DB_PATH", "downloads/credentials.db"))
 ADMIN_USER = os.getenv("CREDDB_WEB_ADMIN_USER", "admin")
