@@ -21,6 +21,14 @@ app.secret_key = os.getenv("CREDDB_SECRET_KEY", "cred-search-static-key-2026")
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_SECURE"] = True
 
+
+@app.after_request
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
 DB_PATH = Path(os.getenv("CREDDB_DB_PATH", "downloads/credentials.db"))
 ADMIN_USER = os.getenv("CREDDB_WEB_ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("CREDDB_WEB_ADMIN_PASS", "")
