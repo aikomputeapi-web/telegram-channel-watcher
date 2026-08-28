@@ -103,15 +103,16 @@ def init_db(db_path: Path | None = None) -> None:
         _apply_pragmas(conn)
         conn.executescript(SCHEMA)
         conn.executescript(FTS_SCHEMA)
-        # Backfill: if FTS table is empty but credentials table has rows,
-        # populate the index in one shot.
-        fts_count = conn.execute("SELECT COUNT(*) FROM credentials_fts").fetchone()[0]
+        # For external content FTS5 tables, COUNT(*) returns the source row count
+        # (not the actual index size), so we check the shadow idx table instead.
+        # If the inverted index is empty but credentials has rows, rebuild the FTS
+        # index in one shot. This handles both fresh DBs and migrating existing VPS DBs.
+        idx_count = conn.execute(
+            "SELECT COUNT(*) FROM credentials_fts_idx"
+        ).fetchone()[0]
         cred_count = conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
-        if fts_count == 0 and cred_count > 0:
-            conn.execute(
-                """INSERT INTO credentials_fts(rowid, domain, username, password)
-                   SELECT id, domain, username, password FROM credentials"""
-            )
+        if idx_count == 0 and cred_count > 0:
+            conn.execute("INSERT INTO credentials_fts(credentials_fts) VALUES('rebuild')")
         conn.commit()
     log.info("DB initialized at %s", db_path)
 
@@ -230,8 +231,11 @@ def search(db_path: Path | None, query: str, limit: int = 100, offset: int = 0) 
     db_path = db_path or DB_PATH
     if not db_path.exists():
         return [], 0
+    if not query.strip():
+        return [], 0
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
+        _apply_pragmas(conn)
         # Trigram tokenizer requires >= 3 chars; fall back to LIKE for shorter queries.
         if len(query) >= 3:
             # FTS5 MATCH against the trigram index — uses inverted index, not a scan.
