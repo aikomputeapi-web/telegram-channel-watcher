@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("credentials_db")
 
-DB_PATH = Path(os.getenv("CREDBB_DB_PATH", "downloads/credentials.db"))
+DB_PATH = Path(os.getenv("CREDDB_DB_PATH", "downloads/credentials.db"))
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
