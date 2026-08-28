@@ -178,13 +178,13 @@ td.username { color: #7ee787; font-family: monospace; }
 </div>
 <div class="search-bar">
   <form method="GET">
-    <input type="text" name="q" value="{{ query or '' }}" placeholder="Search domain, username, password, or origin..." autofocus>
+    <input type="text" name="q" value="{{ query or '' }}" placeholder="Search domain, username, or password..." autofocus>
     <button class="btn btn-primary" type="submit">Search</button>
   </form>
   <a class="btn btn-muted" href="?q=">Reset</a>
 </div>
 <div class="qs">
-  Quick: <code>gmail.com</code> <code>facebook</code> <code>password</code> — matches domain, username, password, and origin.
+  Quick: <code>gmail.com</code> <code>facebook</code> <code>password</code> — matches domain, username, and password (FTS5 trigram index).
 </div>
 {% if results %}
 <table>
@@ -301,6 +301,9 @@ def get_db():
     if not hasattr(g, "_db"):
         g._db = sqlite3.connect(str(DB_PATH))
         g._db.row_factory = sqlite3.Row
+        g._db.execute("PRAGMA journal_mode=WAL")
+        g._db.execute("PRAGMA synchronous=NORMAL")
+        g._db.execute("PRAGMA mmap_size=268435456")
     return g._db
 
 

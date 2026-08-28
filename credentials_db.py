@@ -28,6 +28,13 @@ log = logging.getLogger("credentials_db")
 DB_PATH = Path(os.getenv("CREDBB_DB_PATH", "downloads/credentials.db"))
 
 
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    """Apply performance pragmas for faster reads + concurrent write/read."""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA mmap_size=268435456")
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS credentials (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,9 +56,8 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_cred_domain   ON credentials(domain);
 CREATE INDEX IF NOT EXISTS idx_cred_username ON credentials(username);
-CREATE INDEX IF NOT EXISTS idx_cred_msg_id   ON credentials(msg_id);
-CREATE INDEX IF NOT EXISTS idx_cred_origin   ON credentials(origin);
-CREATE INDEX IF NOT EXISTS idx_cred_password ON credentials(password);
+    CREATE INDEX IF NOT EXISTS idx_cred_msg_id   ON credentials(msg_id);
+    CREATE INDEX IF NOT EXISTS idx_cred_password ON credentials(password);
 
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,12 +70,48 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 """
 
+# FTS5 virtual table with trigram tokenizer for fast substring search.
+# Covers domain, username, password (origin removed — not needed as a search term).
+# Triggers keep the FTS index in sync on INSERT / UPDATE / DELETE.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS credentials_fts USING fts5(
+    domain, username, password,
+    content='credentials', content_rowid='id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS credentials_fts_ai AFTER INSERT ON credentials BEGIN
+    INSERT INTO credentials_fts(rowid, domain, username, password)
+    VALUES (new.id, new.domain, new.username, new.password);
+END;
+CREATE TRIGGER IF NOT EXISTS credentials_fts_ad AFTER DELETE ON credentials BEGIN
+    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password)
+    VALUES ('delete', old.id, old.domain, old.username, old.password);
+END;
+CREATE TRIGGER IF NOT EXISTS credentials_fts_au AFTER UPDATE ON credentials BEGIN
+    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password)
+    VALUES ('delete', old.id, old.domain, old.username, old.password);
+    INSERT INTO credentials_fts(rowid, domain, username, password)
+    VALUES (new.id, new.domain, new.username, new.password);
+END;
+"""
+
 
 def init_db(db_path: Path | None = None) -> None:
     db_path = db_path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path)) as conn:
+        _apply_pragmas(conn)
         conn.executescript(SCHEMA)
+        conn.executescript(FTS_SCHEMA)
+        # Backfill: if FTS table is empty but credentials table has rows,
+        # populate the index in one shot.
+        fts_count = conn.execute("SELECT COUNT(*) FROM credentials_fts").fetchone()[0]
+        cred_count = conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+        if fts_count == 0 and cred_count > 0:
+            conn.execute(
+                """INSERT INTO credentials_fts(rowid, domain, username, password)
+                   SELECT id, domain, username, password FROM credentials"""
+            )
         conn.commit()
     log.info("DB initialized at %s", db_path)
 
@@ -166,6 +208,7 @@ def ingest_records(msg_id: int, output_dir: Path, db_path: Path | None = None) -
         return 0
 
     with sqlite3.connect(str(db_path)) as conn:
+        _apply_pragmas(conn)
         conn.executemany(
             """INSERT OR IGNORE INTO credentials
                (msg_id, domain, username, password, origin, browser,
@@ -182,30 +225,60 @@ def ingest_records(msg_id: int, output_dir: Path, db_path: Path | None = None) -
 
 
 def search(db_path: Path | None, query: str, limit: int = 100, offset: int = 0) -> tuple[list[dict], int]:
-    """Search credentials by domain, username, password, or origin.
+    """Search credentials by domain, username, or password using FTS5 trigram index.
     Returns (results, total_count)."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
         return [], 0
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        pattern = f"%{query}%"
-        count_row = conn.execute(
-            """SELECT COUNT(*) FROM credentials
-               WHERE domain LIKE ? OR username LIKE ? OR password LIKE ?
-                  OR origin LIKE ?""",
-            (pattern, pattern, pattern, pattern),
-        ).fetchone()
-        total = count_row[0] if count_row else 0
-        rows = conn.execute(
-            """SELECT * FROM credentials
-               WHERE domain LIKE ? OR username LIKE ? OR password LIKE ?
-                  OR origin LIKE ?
-               ORDER BY imported_at DESC, id DESC
-               LIMIT ? OFFSET ?""",
-            (pattern, pattern, pattern, pattern, limit, offset),
-        ).fetchall()
+        # Trigram tokenizer requires >= 3 chars; fall back to LIKE for shorter queries.
+        if len(query) >= 3:
+            # FTS5 MATCH against the trigram index — uses inverted index, not a scan.
+            # Double-quote the query to treat it as a phrase; trigram handles substring.
+            fts_query = _fts_escape(query)
+            count_row = conn.execute(
+                """SELECT COUNT(*) FROM credentials_fts
+                   WHERE credentials_fts MATCH ?""",
+                (fts_query,),
+            ).fetchone()
+            total = count_row[0] if count_row else 0
+            rows = conn.execute(
+                """SELECT c.* FROM credentials c
+                   JOIN credentials_fts f ON c.id = f.rowid
+                   WHERE credentials_fts MATCH ?
+                   ORDER BY c.imported_at DESC, c.id DESC
+                   LIMIT ? OFFSET ?""",
+                (fts_query, limit, offset),
+            ).fetchall()
+        else:
+            # Short query: fall back to prefix LIKE on indexed columns (no origin).
+            pattern = f"{query}%"
+            count_row = conn.execute(
+                """SELECT COUNT(*) FROM credentials
+                   WHERE domain LIKE ? OR username LIKE ? OR password LIKE ?""",
+                (pattern, pattern, pattern),
+            ).fetchone()
+            total = count_row[0] if count_row else 0
+            rows = conn.execute(
+                """SELECT * FROM credentials
+                   WHERE domain LIKE ? OR username LIKE ? OR password LIKE ?
+                   ORDER BY imported_at DESC, id DESC
+                   LIMIT ? OFFSET ?""",
+                (pattern, pattern, pattern, limit, offset),
+            ).fetchall()
     return [dict(r) for r in rows], total
+
+
+def _fts_escape(query: str) -> str:
+    """Escape a raw search string into an FTS5 MATCH expression.
+
+    We wrap the query in double-quotes so FTS5 treats it as a single phrase.
+    The trigram tokenizer then does substring matching on the full query.
+    Internal double-quotes are doubled per FTS5 string syntax.
+    """
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'
 
 
 def stats(db_path: Path | None = None) -> dict:
@@ -214,6 +287,7 @@ def stats(db_path: Path | None = None) -> dict:
     if not db_path.exists():
         return {"total": 0, "domains": 0, "messages": 0}
     with sqlite3.connect(str(db_path)) as conn:
+        _apply_pragmas(conn)
         total = conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
         domains = conn.execute("SELECT COUNT(DISTINCT domain) FROM credentials").fetchone()[0]
         messages = conn.execute("SELECT COUNT(DISTINCT msg_id) FROM credentials").fetchone()[0]
