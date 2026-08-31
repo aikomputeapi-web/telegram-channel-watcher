@@ -14,7 +14,12 @@ import os
 import sqlite3
 from pathlib import Path
 
-from flask import Flask, request, redirect, url_for, session, render_template_string, g
+from flask import (
+    Flask, request, redirect, url_for, session, render_template_string, g,
+    Response,
+)
+import csv
+import io
 
 app = Flask(__name__)
 app.secret_key = os.getenv("CREDDB_SECRET_KEY", "cred-search-static-key-2026")
@@ -147,8 +152,6 @@ h1 { color: #58a6ff; margin-bottom: 4px; font-size: 24px; }
 .search-bar input[type="text"] { flex: 1; padding: 10px 14px; font-size: 15px;
     background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e0e0e0; }
 .search-bar input[type="text"]:focus { outline: none; border-color: #58a6ff; }
-.btn { padding: 10px 16px; font-size: 15px; border-radius: 6px; text-decoration: none;
-       cursor: pointer; font-weight: 600; border: none; }
 .btn-primary { background: #238636; color: #fff; }
 .btn-primary:hover { background: #2ea043; }
 .btn-muted { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
@@ -192,6 +195,7 @@ td.username { color: #7ee787; font-family: monospace; }
     <button class="btn btn-primary" type="submit">Search</button>
   </form>
   <a class="btn btn-muted" href="?q=">Reset</a>
+  {% if query %}<a class="btn btn-muted" href="/download?q={{ query }}">⬇ Download CSV</a>{% endif %}
 </div>
 <div class="qs">
   Quick: <code>gmail.com</code> <code>facebook</code> <code>password</code> — matches domain, username, and password (FTS5 trigram index).
@@ -388,6 +392,32 @@ def index():
         stats=s, query=query, results=results, total=total,
         page=page, total_pages=total_pages, offset=offset,
         is_admin=session.get("is_admin"),
+    )
+
+
+@app.route("/download")
+@login_required
+def download_csv():
+    from credentials_db import search as db_search
+
+    query = request.args.get("q", "").strip()
+    if not query:
+        return redirect(url_for("index"))
+
+    rows, total = db_search(DB_PATH, query, 100000, 0)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["#", "Domain", "Username", "Password", "Browser", "Msg", "Source File"])
+    for i, r in enumerate(rows, 1):
+        writer.writerow([i, r["domain"], r.get("username", ""), r["password"],
+                          r.get("browser", ""), r["msg_id"], r.get("source_file", "")])
+
+    filename = f"results_{query[:30]}.csv"
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
     )
 
 
