@@ -1,0 +1,15 @@
+[Unit]
+Description=TG upload receiver (archives land here from watcher bots)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-watcher/downloads
+ExecStart=/opt/tg-watcher/.venv/bin/python /opt/tg-watcher/upload_receiver.py --port 8787 --upload-dir /opt/tg-watcher/downloads
+Restart=always
+RestartSec=15
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

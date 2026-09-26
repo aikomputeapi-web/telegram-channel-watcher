@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — Credential Search</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f1117; color: #e0e0e0; }
+.login { max-width: 360px; margin: 80px auto; background: #161b22; border: 1px solid #30363d;
+         border-radius: 12px; padding: 32px; }
+.login h1 { text-align: center; margin-bottom: 8px; font-size: 22px; color: #58a6ff; }
+.login .sub { text-align: center; color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+.login input { width: 100%; padding: 10px 14px; margin-bottom: 12px; font-size: 15px;
+    background: #0f1117; border: 1px solid #30363d; border-radius: 6px; color: #e0e0e0; }
+.login input:focus { outline: none; border-color: #58a6ff; }
+.login button { width: 100%; padding: 10px; font-size: 15px; background: #238636;
+    color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+.login button:hover { background: #2ea043; }
+.login .alt { text-align: center; margin-top: 16px; font-size: 13px; color: #8b949e; }
+.login .alt a { color: #58a6ff; text-decoration: none; }
+.login .alt a:hover { text-decoration: underline; }
+.msg { padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; text-align: center; }
+.msg.error { background: #3f1618; color: #f85149; border: 1px solid #5e1d20; }
+.msg.success { background: #162b1d; color: #56d364; border: 1px solid #1d3a26; }
+</style>
+</head>
+<body>
+<div class="login">
+  <h1>Credential Search</h1>
+  <div class="sub">Search indexed credentials</div>
+  <div class="msg error">Please sign in</div>
+  <form method="POST" action="/">
+    <input type="text" name="username" placeholder="Username" required autofocus>
+    <input type="password" name="password" placeholder="Password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <div class="alt">Need an account? <a href="/register">Register</a></div>
+</div>
+</body>
+</html>

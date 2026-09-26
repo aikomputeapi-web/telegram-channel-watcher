@@ -8,6 +8,7 @@ files, builds <archive>.db with a `credentials` table. Then merges every
 archive DB into a single combined credentials_all.db (INSERT OR IGNORE dedups
 on the UNIQUE(domain, username, password) constraint).
 """
+
 import sqlite3
 import sys
 from pathlib import Path
@@ -23,6 +24,35 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_credentials_domain ON credentials(domain);
 """
+
+# Defense-in-depth: hard cap password length. Real passwords are short;
+# anything larger is a vault-dump blob the parser mis-captured (Norton wax
+# rules, Bitwarden ciphers, NordPass LevelDB fragments, Mixpanel telemetry).
+MAX_INGEST_PASSWORD_LEN = 4096
+_INGEST_GARBAGE_SIGS = (
+    "ParseCriterias",
+    "VerifyAttributeByAttachedText",
+    "wax_rules_download_timestamp",
+    "ParseCriteriasEx",
+    "LoginCategorizations",
+    "__mp_opt_in_out",
+    "__mplss_",
+    "_mixpanel",
+    'identifier:"nordaccount"',
+    "browser_importer",
+    "last-heartbeat",
+    "_ciphers_ciphers",
+    "_domainSettings",
+    "fillAssistTargetingRulesByServer",
+    "equivalentDomains",
+    "organizationUseTotp",
+)
+
+
+def _is_garbage(password: str) -> bool:
+    if len(password) > MAX_INGEST_PASSWORD_LEN:
+        return True
+    return any(sig in password for sig in _INGEST_GARBAGE_SIGS)
 
 
 def load_into(db_path: Path, cred_files, source_label: str) -> int:
@@ -40,16 +70,22 @@ def load_into(db_path: Path, cred_files, source_label: str) -> int:
                     continue
                 domain, username = parts[0], parts[1] if len(parts) > 1 else ""
                 password = parts[2] if len(parts) > 2 else ""
+                if _is_garbage(password):
+                    continue
                 rows.append((domain, username, password, source_label))
                 if len(rows) >= 5000:
                     conn.executemany(
                         "INSERT OR IGNORE INTO credentials(domain, username, password, source) "
-                        "VALUES (?,?,?,?)", rows)
+                        "VALUES (?,?,?,?)",
+                        rows,
+                    )
                     rows.clear()
     if rows:
         conn.executemany(
             "INSERT OR IGNORE INTO credentials(domain, username, password, source) "
-            "VALUES (?,?,?,?)", rows)
+            "VALUES (?,?,?,?)",
+            rows,
+        )
     conn.commit()
     n = conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
     conn.close()
@@ -66,8 +102,10 @@ def main() -> None:
         try:
             combined.unlink()
         except PermissionError:
-            print(f"WARNING: {combined.name} is locked (open in another app). "
-                  f"Writing to {combined.name}.new instead - close the app and rename if desired.")
+            print(
+                f"WARNING: {combined.name} is locked (open in another app). "
+                f"Writing to {combined.name}.new instead - close the app and rename if desired."
+            )
             combined = base / "credentials_all.db.new"
     combined_conn = sqlite3.connect(str(combined))
     combined_conn.executescript(SCHEMA)
@@ -95,16 +133,22 @@ def main() -> None:
                         continue
                     domain, username = parts[0], parts[1] if len(parts) > 1 else ""
                     password = parts[2] if len(parts) > 2 else ""
+                    if _is_garbage(password):
+                        continue
                     combined_rows.append((domain, username, password, archive.name))
                     if len(combined_rows) >= 5000:
                         combined_conn.executemany(
                             "INSERT OR IGNORE INTO credentials(domain, username, password, source) "
-                            "VALUES (?,?,?,?)", combined_rows)
+                            "VALUES (?,?,?,?)",
+                            combined_rows,
+                        )
                         combined_rows.clear()
     if combined_rows:
         combined_conn.executemany(
             "INSERT OR IGNORE INTO credentials(domain, username, password, source) "
-            "VALUES (?,?,?,?)", combined_rows)
+            "VALUES (?,?,?,?)",
+            combined_rows,
+        )
     combined_conn.commit()
     n = combined_conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
     combined_conn.close()

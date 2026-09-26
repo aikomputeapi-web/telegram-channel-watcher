@@ -1,0 +1,24 @@
+# from https://mytelegram.org -> API development tools
+TG_API_ID=33911461
+TG_API_HASH=dd9ffc5ce15dc9ff2d9072f2bf035327
+
+# from `python make_session.py` (preferred) - or leave empty to use a local
+# watcher-session file created on first interactive login
+TG_SESSION_STRING=1AZWarzkBu0JzodghiMwR4yhb37cicYlH-ARcsRJKGXAf8tpp3lNI31Dz_BvKz3TerC1OmzGaQ-gDcDzSf8rj8goxJ0a_FJGsM9r2231D00o-KgJlhbS4wWB7fUe6HQDTNvB-cNDDoKMWUEsKE2BzkkBt4rP0RRVHNcdAfYyWhTe0T77TLLgMeL7lg6VvzSkNnvi5_VpvbNFjxLdxafP26uMmOUiGdAV5vC7vxzEmkUhbHEln-xHG_WzfuXlBJRqdA_qV_yBRz3K_6vQa0PZJeMFJTlF649tGcy5UfO5LPfGDd3mg6tHp8SgV33QS4kdbXYTFSjI55CP6JqFUCtYTZDu49b7c7rA=
+
+# OBSERVERCLOUD channel; resolves via public username (resilient to entity-cache loss)
+CHANNEL=OBSERVERNEVERDIE
+
+DOWNLOAD_DIR=downloads
+STATE_FILE=state.json
+# one-time catch-up on first run: 48h covers Sept 25 posts (msg 1702/1703)
+BACKFILL_HOURS=48
+# window re-checked on every start, catches posts missed while offline
+SWEEP_HOURS=2
+# optional: explicit path to 7z/7zz binary (auto-detected otherwise)
+#SEVENZIP=/usr/bin/7zz
+
+CREDDB_DB_PATH=/opt/tg-watcher/downloads/downloads/credentials.db
+CREDDB_PORT=5000
+
+CREDDB_WEB_ADMIN_PASS=Dirty2020!Passwordcameron123

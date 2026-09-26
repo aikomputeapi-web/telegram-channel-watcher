@@ -1,0 +1,8 @@
+[Unit]
+Description=tg-watcher health check + Telegram alert
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tg-watcher
+ExecStart=/opt/tg-watcher/.venv/bin/python /opt/tg-watcher/health_check.py
+TimeoutStartSec=180
