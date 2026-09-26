@@ -18,6 +18,9 @@ ARCHIVE_EXTS = {".zip", ".7z", ".rar"}
 
 # matches ".pass: secret" / ".PASS： secret" (fullwidth colon tolerated)
 PW_RE = re.compile(r"\.pass\s*[:\uff1a]\s*(.+)", re.IGNORECASE)
+# Fallback for channels that post "🔑 Password: secret" style lines without the
+# leading dot. (?<![\w.]) avoids matching inside words/URLs (bypass:, surpass:).
+PW_RE_LOOSE = re.compile(r"(?<![\w.])pass(?:word)?\s*[:\uff1a]\s*(.+)", re.IGNORECASE)
 
 _SEVENZIP_CANDIDATES = ("7zz", "7z", "7za")
 
@@ -32,13 +35,20 @@ def is_supported_archive(name: str) -> bool:
 
 def password_candidates(text):
     """Likely passwords from a post body: everything after '.pass:' on that line,
-    then (fallback) just the first whitespace-delimited token of it."""
+    then (fallback) just the first whitespace-delimited token of it. A looser
+    'Password:' pattern is tried when the dotted form is absent (some channels
+    point at another channel for the password: those URL values still become
+    candidates so the failure log shows what was tried)."""
     if not text:
         return []
+    raw = None
     m = PW_RE.search(text)
-    if not m:
-        return []
-    raw = m.group(1).strip().strip('"').strip("'").strip()
+    if m:
+        raw = m.group(1).strip().strip('"').strip("'").strip()
+    if not raw:
+        m2 = PW_RE_LOOSE.search(text)
+        if m2:
+            raw = m2.group(1).strip().strip('"').strip("'").strip()
     if not raw:
         return []
     cands = [raw]
