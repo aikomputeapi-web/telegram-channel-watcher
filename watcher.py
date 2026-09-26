@@ -286,13 +286,17 @@ async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> 
     ok = False
 
     def _usable(out_dir: Path) -> bool:
-        """A batch counts as parsed when it produced a non-empty records.jsonl.
-        The parser flags batches with any non-recoverable diagnostic (e.g.
-        ARCHIVE_SAFETY on random cache files that happen to look like tars)
-        with exit code 3 even when it wrote every other record - those outputs
-        are real data, and per-record garbage is filtered at ingest anyway."""
+        """A batch counts as parsed when it produced a non-empty records.jsonl
+        AND the final atomic manifest.json marker. The parser flags batches
+        with any non-recoverable diagnostic (e.g. ARCHIVE_SAFETY on random
+        cache files that happen to look like tars) with exit code 3 even when
+        it wrote every other record - those outputs are real data, and
+        per-record garbage is filtered at ingest anyway."""
         try:
-            return (out_dir / "records.jsonl").stat().st_size > 0
+            return (
+                (out_dir / "records.jsonl").stat().st_size > 0
+                and (out_dir / "manifest.json").is_file()
+            )
         except OSError:
             return False
 
