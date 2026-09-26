@@ -8,19 +8,30 @@ Posts must contain a document (.zip/.7z/.rar) and a password line like:
 Login is one-time: run make_session.py to generate TG_SESSION_STRING, put it in
 .env (or export it on your VPS), then just run this script forever.
 """
+
 import argparse
 import asyncio
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing local modules: credentials_db reads
+# CREDDB_DB_PATH from the environment at import time, and without this
+# ordering every ingest silently goes to downloads/credentials.db instead
+# of the main DB.
+load_dotenv()
+
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from extractor import extract_archive, is_supported_archive, password_candidates
@@ -33,8 +44,6 @@ from domain_hits import (
     write_domain_hits,
 )
 from credentials_db import ingest_records, init_db
-
-load_dotenv()
 
 API_ID = os.getenv("TG_API_ID")
 API_HASH = os.getenv("TG_API_HASH")
@@ -64,13 +73,57 @@ GDRIVE_FOLDER = os.getenv("GDRIVE_FOLDER", "telegram-watcher").strip()
 UPLOAD_URL = os.getenv("UPLOAD_URL", "").strip().rstrip("/")
 UPLOAD_CHUNK_MB = float(os.getenv("UPLOAD_CHUNK_MB", "50"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+# Telegram FloodWait <= this many seconds is slept off then retried once;
+# longer waits leave the message pending (not counted as a failure).
+FLOOD_WAIT_SLEEP_MAX = int(os.getenv("FLOOD_WAIT_SLEEP_MAX", "900"))
+# Low-disk guard: refuse new downloads unless this many GB stay free
+# (on top of the archive + estimated extraction+parse size).
+MIN_FREE_GB = float(os.getenv("MIN_FREE_GB", "3"))
+# Estimated total disk cost of one archive as a multiple of its compressed
+# size (extraction + records.jsonl parse output). Log-heavy archives expand
+# to ~10x; 6 is a workable default that still lets big rars through when
+# disk has room.
+DISK_SIZE_MULTIPLIER = float(os.getenv("DISK_SIZE_MULTIPLIER", "6"))
+# When free disk drops below this, failed-extraction archives are deleted
+# instead of kept for retry (re-downloaded if a retry ever succeeds later).
+KEEP_ARCHIVE_MIN_FREE_GB = float(os.getenv("KEEP_ARCHIVE_MIN_FREE_GB", "10"))
+# Pipeline requeue: failed (counted) or pending (disk/floodwait/system)
+# messages are automatically retried after this many minutes instead of
+# waiting for the next service restart/sweep.
+RETRY_DELAY_MIN = float(os.getenv("RETRY_DELAY_MIN", "60"))
 MAX_STATE = 20000
 FAILURES_FILE = Path(os.getenv("FAILURES_FILE", "failures.json"))
+# Pipeline heartbeat: the worker refreshes this file at every step so the
+# external health monitor can detect a stuck pipeline.
+HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", ".pipeline_heartbeat"))
+
+
+class PipelineError(Exception):
+    """A pipeline step failed.
+
+    counted=True  -> data-quality failure (counts toward MAX_RETRIES abandon)
+    counted=False -> system/transient failure (stays pending, retried, alert)
+    """
+
+    def __init__(self, message: str, counted: bool = False):
+        super().__init__(message)
+        self.counted = counted
+
+
+def heartbeat(step: str, msg_id: int = 0, detail: str = "") -> None:
+    """Best-effort heartbeat write; never raises."""
+    try:
+        HEARTBEAT_FILE.write_text(
+            json.dumps({"step": step, "msg_id": msg_id, "detail": detail, "ts": time()})
+        )
+    except OSError:
+        pass
+
 
 log = logging.getLogger("watcher")
 
 _parse_lock = asyncio.Lock()
-_parse_tasks: set = set()
+_work: asyncio.Queue = asyncio.Queue()  # serial pipeline work queue (msg refs)
 _failures: dict = {}
 
 
@@ -92,7 +145,10 @@ def record_failure(msg_id: int, reason: str) -> bool:
     """Record a failure attempt for msg_id. Returns True if the message has
     exceeded MAX_RETRIES and should be abandoned (added to processed)."""
     key = str(msg_id)
-    _failures[key] = {"count": _failures.get(key, {}).get("count", 0) + 1, "last_reason": reason}
+    _failures[key] = {
+        "count": _failures.get(key, {}).get("count", 0) + 1,
+        "last_reason": reason,
+    }
     failed = _failures[key]["count"] >= MAX_RETRIES
     save_failures()
     return failed
@@ -103,6 +159,39 @@ def clear_failure(msg_id: int) -> None:
     if key in _failures:
         del _failures[key]
         save_failures()
+
+
+def _free_bytes(path: Path) -> int:
+    """Free bytes on the filesystem containing `path`."""
+    return shutil.disk_usage(str(path)).free
+
+
+def cleanup_ingested_leftovers(processed: set) -> int:
+    """Delete download leftovers (extracted dirs + source archives) for msg
+    ids already in `processed`. Protects against the ENOSPC cascade where a
+    mid-run cleanup failure leaves tens of GB behind and crashes the watcher
+    on save_state. Returns bytes freed."""
+    freed = 0
+    if not DOWNLOAD_DIR.exists():
+        return 0
+    proc_ids = {str(x).rsplit(":", 1)[-1] for x in processed}
+    for entry in sorted(DOWNLOAD_DIR.iterdir()):
+        m = re.match(r"^(\d+)_", entry.name)
+        if not m or m.group(1) not in proc_ids:
+            continue
+        try:
+            if entry.is_dir():
+                freed += sum(
+                    f.stat().st_size for f in entry.rglob("*") if f.is_file()
+                )
+                shutil.rmtree(entry, ignore_errors=True)
+            elif entry.is_file():
+                freed += entry.stat().st_size
+                entry.unlink()
+            log.info("disk guard: removed ingested leftover %s", entry.name)
+        except OSError as exc:
+            log.warning("disk guard: could not remove %s: %s", entry, exc)
+    return freed
 
 
 def _dir_metrics(root: Path) -> tuple[int, int]:
@@ -145,8 +234,12 @@ def _parse_batches(source_dir: Path) -> list[list[Path]]:
     for d in dirs:
         total, count = _dir_metrics(d)
         if total > PARSE_MAX_TOTAL_MB * 1024 * 1024 or count > PARSE_MAX_FILES:
-            log.warning("parsing %s: subdir %.1f MB / %d files exceeds PARSE_MAX_*; skipping it",
-                        d.name, total / 1e6, count)
+            log.warning(
+                "parsing %s: subdir %.1f MB / %d files exceeds PARSE_MAX_*; skipping it",
+                d.name,
+                total / 1e6,
+                count,
+            )
             continue
         if current and (
             current_bytes + total > batch_bytes
@@ -166,69 +259,119 @@ def _parse_batches(source_dir: Path) -> list[list[Path]]:
     return batches
 
 
-async def _parse_in_background(msg_id: int, source_dir: Path, output_dir: Path) -> None:
-    """Run the log parser off the event loop; serialize parses so a small VM
-    never runs several at once. Oversized extractions are split into batches."""
+async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> bool:
+    """Pipeline step: parse. Blocking (awaited inline), serialized by
+    _parse_lock so a small VM never parses two archives at once. Oversized
+    extractions are split into batches. Returns True only if at least one
+    batch exited 0 (usable output)."""
     total, count = _dir_metrics(source_dir)
     if total > PARSE_MAX_TOTAL_MB * 1024 * 1024 or count > PARSE_MAX_FILES:
-        log.info("msg %d: extracting dir is %.1f MB / %d files - parsing in %d batch(es)",
-                 msg_id, total / 1e6, count,
-                 len(_parse_batches(source_dir)))
+        log.info(
+            "msg %d: extracting dir is %.1f MB / %d files - parsing in %d batch(es)",
+            msg_id,
+            total / 1e6,
+            count,
+            len(_parse_batches(source_dir)),
+        )
     else:
-        log.info("msg %d: parsing extracted logs in background (%.1f MB / %d files)...",
-                 msg_id, total / 1e6, count)
+        log.info(
+            "msg %d: parsing extracted logs (%.1f MB / %d files)...",
+            msg_id,
+            total / 1e6,
+            count,
+        )
 
     batches = _parse_batches(source_dir)
     grand = {"record_count": 0, "accepted_files": 0, "skipped_files": 0}
     ok = False
+
+    def _usable(out_dir: Path) -> bool:
+        """A batch counts as parsed when it produced a non-empty records.jsonl.
+        The parser flags batches with any non-recoverable diagnostic (e.g.
+        ARCHIVE_SAFETY on random cache files that happen to look like tars)
+        with exit code 3 even when it wrote every other record - those outputs
+        are real data, and per-record garbage is filtered at ingest anyway."""
+        try:
+            return (out_dir / "records.jsonl").stat().st_size > 0
+        except OSError:
+            return False
+
     async with _parse_lock:
         for i, batch in enumerate(batches, start=1):
+            heartbeat("parse", msg_id, f"batch {i}/{len(batches)}")
             if len(batches) > 1:
                 batch_out = output_dir / f"part-{i:03d}"
             else:
                 batch_out = output_dir
+            if _usable(batch_out):
+                log.info("msg %d: batch %d/%d already parsed - skipping", msg_id, i, len(batches))
+                ok = True
+                continue
             label = ", ".join(p.name for p in batch[:3])
             if len(batch) > 3:
                 label += f", ... ({len(batch)} items)"
-            log.info("msg %d: parsing batch %d/%d (%s)...", msg_id, i, len(batches), label)
-            result = await asyncio.to_thread(
-                parse_extracted_dirs, batch, batch_out,
-                redaction=PARSER_REDACTION, family=PARSER_FAMILY,
+            log.info(
+                "msg %d: parsing batch %d/%d (%s)...", msg_id, i, len(batches), label
             )
-            if result is None:
-                log.warning("msg %d: batch %d/%d parsing failed (parser not installed or errored)",
-                            msg_id, i, len(batches))
+            result = await asyncio.to_thread(
+                parse_extracted_dirs,
+                batch,
+                batch_out,
+                redaction=PARSER_REDACTION,
+                family=PARSER_FAMILY,
+            )
+            if result is None and not _usable(batch_out):
+                log.warning(
+                    "msg %d: batch %d/%d parsing failed (parser not installed or errored)",
+                    msg_id,
+                    i,
+                    len(batches),
+                )
                 continue
-            grand["record_count"] += result.get("record_count", 0)
-            grand["accepted_files"] += result.get("accepted_files", 0)
-            grand["skipped_files"] += result.get("skipped_files", 0)
-            if result["exit_code"] == 0:
+            if result is not None:
+                grand["record_count"] += result.get("record_count", 0)
+                grand["accepted_files"] += result.get("accepted_files", 0)
+                grand["skipped_files"] += result.get("skipped_files", 0)
+            if _usable(batch_out):
                 ok = True
-                log.info("msg %d: batch %d/%d parsed %d records (family=%s, score=%.3f)",
-                         msg_id, i, len(batches), result["record_count"],
-                         result["family"], result["family_score"])
-            else:
-                log.warning("msg %d: batch %d/%d exit code %d (see diagnostics.jsonl)",
-                            msg_id, i, len(batches), result["exit_code"])
-    if not ok:
-        log.warning("msg %d: log parsing produced no usable output; extracted files kept at %s",
-                    msg_id, source_dir)
-    elif len(batches) > 1:
-        log.info("msg %d: parsed %d records total across %d batches -> %s",
-                 msg_id, grand["record_count"], len(batches), output_dir)
+                extra = (
+                    f"records={result.get('record_count', '?')} "
+                    if result is not None
+                    else "records resumed "
+                )
+                if result is not None and result.get("exit_code", 0) != 0:
+                    extra += f"(exit {result['exit_code']} - still accepted by artifacts)"
+                log.info(
+                    "msg %d: batch %d/%d parsed %s-> %s",
+                    msg_id,
+                    i,
+                    len(batches),
+                    extra,
+                    batch_out.name,
+                )
+            elif result is not None:
+                log.warning(
+                    "msg %d: batch %d/%d exit code %d with no usable output (see diagnostics.jsonl)",
+                    msg_id,
+                    i,
+                    len(batches),
+                    result["exit_code"],
+                )
+    if ok and len(batches) > 1:
+        log.info(
+            "msg %d: parsed %d records total across %d batches -> %s",
+            msg_id,
+            grand["record_count"],
+            len(batches),
+            output_dir,
+        )
+    return ok
 
-    if ok:
-        _finalize_parsed(msg_id, source_dir, output_dir)
-    return
 
-
-def _finalize_parsed(msg_id: int, source_dir: Path, output_dir: Path) -> None:
-    """After an archive finishes parsing: write per-archive + global domain_hits
-    files and optionally upload the outputs to the local PC via the cloudflared
-    tunnel (or a configured remote). On success the extracted source dir and the
-    parsed dir (records.jsonl etc.) are deleted to free disk."""
+def aggregate_outputs(msg_id: int, output_dir: Path) -> None:
+    """Pipeline step: write per-archive + global domain_hits / credentials
+    files. Warn-only (aggregation failure never blocks ingestion)."""
     try:
-        # Per-part (chunk) outputs: domain_hits.txt + credentials.txt
         parts = sorted(output_dir.glob("part-*"))
         if parts:
             for part in parts:
@@ -239,33 +382,39 @@ def _finalize_parsed(msg_id: int, source_dir: Path, output_dir: Path) -> None:
             recs = records_files_for(output_dir)
             write_domain_hits(count_domain_hits(recs), output_dir / "domain_hits.txt")
             write_credentials(collect_credentials(recs), output_dir / "credentials.txt")
-        log.info("msg %d: domain_hits + credentials written for %s", msg_id, output_dir.name)
+        log.info(
+            "msg %d: domain_hits + credentials written for %s", msg_id, output_dir.name
+        )
     except Exception as exc:
         log.warning("msg %d: credentials/domain aggregation failed: %s", msg_id, exc)
 
-    uploaded = False
+
+def upload_outputs(msg_id: int, output_dir: Path) -> None:
+    """Pipeline step (optional): copy parsed outputs to the local PC via the
+    cloudflared tunnel (or a configured remote). Warn-only."""
     if UPLOAD_URL:
-        uploaded = _upload_via_http(msg_id, output_dir)
+        _upload_via_http(msg_id, output_dir)
     elif GDRIVE_REMOTE:
-        uploaded = _upload_to_drive(msg_id, output_dir)
-
-    try:
-        n = ingest_records(msg_id, output_dir)
-        log.info("msg %d: ingested %d credentials into SQLite DB", msg_id, n)
-    except Exception as exc:
-        log.warning("msg %d: DB ingestion failed: %s", msg_id, exc)
-
-    if uploaded:
-        for d in (source_dir, output_dir):
-            try:
-                if d.exists():
-                    d.unlink() if d.is_file() else __import__("shutil").rmtree(d)
-                    log.info("msg %d: cleaned up %s", msg_id, d)
-            except Exception as exc:
-                log.warning("msg %d: cleanup of %s failed: %s", msg_id, d, exc)
+        _upload_to_drive(msg_id, output_dir)
 
 
-def _upload_via_http(msg_id: int, output_dir: Path) -> None:
+def _cleanup_files(msg_id: int, *paths: Path) -> None:
+    """Pipeline step: delete files after successful ingestion; verify removal."""
+    for d in paths:
+        try:
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+            elif d.exists():
+                d.unlink()
+            if d.exists():
+                log.warning("msg %d: cleanup verify failed - %s still exists", msg_id, d)
+            else:
+                log.info("msg %d: cleaned up %s", msg_id, d)
+        except Exception as exc:
+            log.warning("msg %d: cleanup of %s failed: %s", msg_id, d, exc)
+
+
+def _upload_via_http(msg_id: int, output_dir: Path) -> bool:
     """Copy the parsed outputs (domain_hits.txt, summary.csv, records.jsonl, ...)
     to the configured UPLOAD_URL (a cloudflared tunnel to the user's PC) via HTTP
     PUT. Files larger than UPLOAD_CHUNK_MB are uploaded in Content-Range chunks
@@ -275,8 +424,11 @@ def _upload_via_http(msg_id: int, output_dir: Path) -> None:
 
     chunk_bytes = int(UPLOAD_CHUNK_MB * 1024 * 1024) if UPLOAD_CHUNK_MB else 0
 
-    files = sorted(f for f in output_dir.rglob("*")
-                   if f.is_file() and f.name in ("credentials.txt", "domain_hits.txt"))
+    files = sorted(
+        f
+        for f in output_dir.rglob("*")
+        if f.is_file() and f.name in ("credentials.txt", "domain_hits.txt")
+    )
     if not files:
         log.warning("msg %d: nothing to upload for %s", msg_id, output_dir)
         return
@@ -299,14 +451,35 @@ def _upload_via_http(msg_id: int, output_dir: Path) -> None:
                         end = sent + len(chunk) - 1
                         header = f"bytes {start}-{end}/{size}"
                         proc = subprocess.run(
-                            ["curl", "-sS", "-f", "-X", "PUT", "-H", f"Content-Range: {header}",
-                             "--data-binary", "@-", dest],
-                            input=chunk, capture_output=True, timeout=900,
+                            [
+                                "curl",
+                                "-sS",
+                                "-f",
+                                "-X",
+                                "PUT",
+                                "-H",
+                                f"Content-Range: {header}",
+                                "--data-binary",
+                                "@-",
+                                dest,
+                            ],
+                            input=chunk,
+                            capture_output=True,
+                            timeout=900,
                         )
                         if proc.returncode != 0:
-                            err = (proc.stderr or b"").decode("utf-8", "replace").strip()[:200]
-                            log.warning("msg %d: upload chunk of %s failed (rc=%d): %s",
-                                        msg_id, rel, proc.returncode, err)
+                            err = (
+                                (proc.stderr or b"")
+                                .decode("utf-8", "replace")
+                                .strip()[:200]
+                            )
+                            log.warning(
+                                "msg %d: upload chunk of %s failed (rc=%d): %s",
+                                msg_id,
+                                rel,
+                                proc.returncode,
+                                err,
+                            )
                             break
                         sent += len(chunk)
                 if sent >= size:
@@ -314,7 +487,9 @@ def _upload_via_http(msg_id: int, output_dir: Path) -> None:
                 continue
             proc = subprocess.run(
                 ["curl", "-sS", "-f", "-T", str(f), dest],
-                capture_output=True, text=True, timeout=900,
+                capture_output=True,
+                text=True,
+                timeout=900,
             )
         except Exception as exc:
             log.warning("msg %d: upload of %s failed to run: %s", msg_id, rel, exc)
@@ -322,10 +497,17 @@ def _upload_via_http(msg_id: int, output_dir: Path) -> None:
         if proc.returncode == 0:
             ok += 1
         else:
-            log.warning("msg %d: upload of %s failed (rc=%d): %s",
-                        msg_id, rel, proc.returncode, (proc.stderr or "").strip()[:200])
+            log.warning(
+                "msg %d: upload of %s failed (rc=%d): %s",
+                msg_id,
+                rel,
+                proc.returncode,
+                (proc.stderr or "").strip()[:200],
+            )
     if ok:
-        log.info("msg %d: uploaded %d/%d files to %s", msg_id, ok, len(files), UPLOAD_URL)
+        log.info(
+            "msg %d: uploaded %d/%d files to %s", msg_id, ok, len(files), UPLOAD_URL
+        )
         return True
     log.warning("msg %d: all %d uploads failed to %s", msg_id, len(files), UPLOAD_URL)
     return False
@@ -348,25 +530,95 @@ def _upload_to_drive(msg_id: int, output_dir: Path) -> bool:
     try:
         proc = subprocess.run(
             [rclone, "copy", str(output_dir), dest, "--create-empty-src-dirs"],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
     except Exception as exc:
         log.warning("msg %d: drive upload failed to run: %s", msg_id, exc)
         return False
     if proc.returncode != 0:
-        log.warning("msg %d: drive upload failed (rc=%d): %s",
-                    msg_id, proc.returncode, (proc.stderr or "").strip()[:500])
+        log.warning(
+            "msg %d: drive upload failed (rc=%d): %s",
+            msg_id,
+            proc.returncode,
+            (proc.stderr or "").strip()[:500],
+        )
         return False
     log.info("msg %d: uploaded parsed outputs to %s", msg_id, dest)
     return True
 
 
-def schedule_parse(msg_id: int, source_dir: Path, output_dir: Path) -> None:
-    if not PARSE_LOGS:
+def is_candidate(msg) -> bool:
+    """True if the post carries an archive document or a download-bot deep
+    link (i.e. belongs on the pipeline queue)."""
+    fname = document_name(msg) if msg.document else None
+    return bool(fname or bot_deep_link(msg))
+
+
+def _scrub_partials() -> None:
+    """Startup scrub: remove orphan .parsed dirs left behind by restarts.
+    Partial ARCHIVES are not scrubbed here - the pipeline's exact-size check
+    (expected vs actual bytes) deletes and re-downloads them automatically
+    when the message is processed, so complete archives kept for extraction
+    retries survive restarts."""
+    if not DOWNLOAD_DIR.exists():
         return
-    task = asyncio.get_running_loop().create_task(_parse_in_background(msg_id, source_dir, output_dir))
-    _parse_tasks.add(task)
-    task.add_done_callback(_parse_tasks.discard)
+    for entry in sorted(DOWNLOAD_DIR.iterdir()):
+        try:
+            if entry.is_dir() and entry.name.endswith(".parsed"):
+                if not (DOWNLOAD_DIR / entry.name[: -len(".parsed")]).exists():
+                    shutil.rmtree(entry, ignore_errors=True)
+                    log.info("scrub: removed orphan parsed dir %s", entry.name)
+        except OSError as exc:
+            log.warning("scrub: could not handle %s: %s", entry, exc)
+
+
+_requeue_tasks: set = set()
+
+
+def _requeue_later(msg, processed: set) -> None:
+    """Re-enqueue a failed/pending message after RETRY_DELAY_MIN so retries
+    happen automatically without waiting for the next restart/sweep."""
+
+    async def _later():
+        await asyncio.sleep(RETRY_DELAY_MIN * 60)
+        if msg.id not in processed:
+            _work.put_nowait(msg)
+            log.info(
+                "pipeline: requeued msg %d for retry (%d queued)", msg.id, _work.qsize()
+            )
+
+    task = asyncio.get_running_loop().create_task(_later())
+    _requeue_tasks.add(task)
+    task.add_done_callback(_requeue_tasks.discard)
+
+
+async def _pipeline_worker(client: TelegramClient, processed: set, bot_lock: asyncio.Lock) -> None:
+    """Single serial worker: pops one message at a time and runs it through
+    the full verified pipeline (download -> extract -> parse -> ingest ->
+    delete). No two archives are ever in flight at once. Failed (counted) or
+    pending (disk/floodwait/system) messages are requeued automatically."""
+    while True:
+        msg = await _work.get()
+        status = "pending"
+        try:
+            status = await process_message(client, msg, processed, bot_lock)
+        except Exception:
+            log.exception(
+                "pipeline worker: unhandled error on msg %s - continuing",
+                getattr(msg, "id", "?"),
+            )
+        finally:
+            _work.task_done()
+        if status in ("pending", "counted"):
+            log.info(
+                "pipeline: msg %d %s - auto-retry in %.0f min",
+                getattr(msg, "id", 0),
+                status,
+                RETRY_DELAY_MIN,
+            )
+            _requeue_later(msg, processed)
 
 
 def load_state() -> set:
@@ -377,7 +629,7 @@ def load_state() -> set:
 
 
 def save_state(processed: set) -> None:
-    ids = sorted(processed)[-MAX_STATE:]
+    ids = sorted(str(x) for x in processed)[-MAX_STATE:]
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps({"processed": ids}), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -410,7 +662,9 @@ async def resolve_entity(client: TelegramClient, ref):
             return dlg.entity
         if dlg.name and uname in dlg.name.lower():
             return dlg.entity
-    raise SystemExit(f"Could not resolve channel '{ref}'. Run make_session.py to list your channels.")
+    raise SystemExit(
+        f"Could not resolve channel '{ref}'. Run make_session.py to list your channels."
+    )
 
 
 def document_name(msg):
@@ -428,7 +682,12 @@ def bot_deep_link(msg):
             if not url:
                 continue
             parsed = urlparse(url)
-            if parsed.hostname not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+            if parsed.hostname not in {
+                "t.me",
+                "www.t.me",
+                "telegram.me",
+                "www.telegram.me",
+            }:
                 continue
             bot = parsed.path.strip("/").split("/", 1)[0].lstrip("@").lower()
             payload = parse_qs(parsed.query).get("start", [None])[0]
@@ -437,22 +696,30 @@ def bot_deep_link(msg):
     return None
 
 
-async def request_bot_document(client: TelegramClient, bot: str, payload: str, lock: asyncio.Lock):
+async def request_bot_document(
+    client: TelegramClient, bot: str, payload: str, lock: asyncio.Lock
+):
     log.info("requesting file from @%s", bot)
     async with lock:
         deadline = monotonic() + BOT_RESPONSE_TIMEOUT
-        async with client.conversation(bot, timeout=BOT_RESPONSE_TIMEOUT, exclusive=True) as conv:
+        async with client.conversation(
+            bot, timeout=BOT_RESPONSE_TIMEOUT, exclusive=True
+        ) as conv:
             await conv.send_message(f"/start {payload}")
             while True:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                response = await asyncio.wait_for(conv.get_response(), timeout=remaining)
+                response = await asyncio.wait_for(
+                    conv.get_response(), timeout=remaining
+                )
                 if response.document:
                     return response
 
 
-async def process_message(client: TelegramClient, msg, processed: set, bot_lock: asyncio.Lock) -> None:
+async def _process_message_impl(
+    client: TelegramClient, msg, processed: set, bot_lock: asyncio.Lock
+) -> None:
     if msg.id in processed:
         return
 
@@ -460,96 +727,294 @@ async def process_message(client: TelegramClient, msg, processed: set, bot_lock:
     fname = document_name(source) if source.document else None
     deep_link = None if fname else bot_deep_link(msg)
     if not fname and not deep_link:
-        return
+        return "skip"
 
     candidates = password_candidates(getattr(msg, "message", "") or "")
     if not candidates:
         log.warning("msg %d: no '.pass:' line found in post - leaving pending", msg.id)
-        return
+        return "skip"
 
     if deep_link:
         bot, payload = deep_link
-        try:
-            source = await request_bot_document(client, bot, payload, bot_lock)
-        except asyncio.TimeoutError:
-            log.error("msg %d: timed out waiting for @%s to return a file (attempt %d/%d)",
-                      msg.id, bot, _failures.get(str(msg.id), {}).get("count", 0) + 1, MAX_RETRIES)
-            if record_failure(msg.id, f"bot_timeout:{bot}"):
-                log.warning("msg %d: abandoning after %d failed bot attempts - marked processed", msg.id, MAX_RETRIES)
-                processed.add(msg.id)
-                save_state(processed)
-            return
-        except Exception as e:
-            log.error("msg %d: @%s file request failed: %s", msg.id, bot, e)
-            if record_failure(msg.id, f"bot_error:{e}"):
-                log.warning("msg %d: abandoning after %d failures - marked processed", msg.id, MAX_RETRIES)
-                processed.add(msg.id)
-                save_state(processed)
-            return
+        source = None
+        for attempt in (1, 2):
+            try:
+                source = await request_bot_document(client, bot, payload, bot_lock)
+                break
+            except FloodWaitError as e:
+                wait = int(getattr(e, "seconds", 0) or 0)
+                if attempt == 1 and 0 < wait <= FLOOD_WAIT_SLEEP_MAX:
+                    log.warning(
+                        "msg %d: Telegram flood-wait %ds talking to @%s - "
+                        "sleeping it off, then one retry",
+                        msg.id,
+                        wait,
+                        bot,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                log.warning(
+                    "msg %d: Telegram flood-wait %ds talking to @%s - leaving "
+                    "pending for the next sweep (not counted as a failure)",
+                    msg.id,
+                    wait,
+                    bot,
+                )
+                return "pending"
+            except asyncio.TimeoutError:
+                log.error(
+                    "msg %d: timed out waiting for @%s to return a file (attempt %d/%d)",
+                    msg.id,
+                    bot,
+                    _failures.get(str(msg.id), {}).get("count", 0) + 1,
+                    MAX_RETRIES,
+                )
+                if record_failure(msg.id, f"bot_timeout:{bot}"):
+                    log.warning(
+                        "msg %d: abandoning after %d failed bot attempts - marked processed",
+                        msg.id,
+                        MAX_RETRIES,
+                    )
+                    processed.add(msg.id)
+                    save_state(processed)
+                    return "abandoned"
+                return "counted"
+            except Exception as e:
+                log.error("msg %d: @%s file request failed: %s", msg.id, bot, e)
+                if record_failure(msg.id, f"bot_error:{e}"):
+                    log.warning(
+                        "msg %d: abandoning after %d failures - marked processed",
+                        msg.id,
+                        MAX_RETRIES,
+                    )
+                    processed.add(msg.id)
+                    save_state(processed)
+                    return "abandoned"
+                return "counted"
+        if source is None:
+            return "pending"
         fname = document_name(source)
         if not fname:
-            log.error("msg %d: @%s returned an unsupported or unnamed document", msg.id, bot)
-            return
+            log.error(
+                "msg %d: @%s returned an unsupported or unnamed document", msg.id, bot
+            )
+            return "skip"
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     target = DOWNLOAD_DIR / f"{msg.id}_{fname}"
-    dest = DOWNLOAD_DIR / f"{msg.id}_{Path(fname).stem}"
+    stem = Path(fname).stem
+    dest = DOWNLOAD_DIR / f"{msg.id}_{stem}"
+    parse_out = DOWNLOAD_DIR / f"{msg.id}_{stem}.parsed"
 
-    if dest.exists() and any(dest.rglob("*")):
-        log.info("msg %d: extracted dir already exists at %s - skipping download/extraction", msg.id, dest)
-    elif not (target.exists() and target.stat().st_size > 0):
-        size_mb = (source.document.size or 0) / 1e6
-        log.info("msg %d: downloading %s (%.1f MB)", msg.id, fname, size_mb)
-        last = {"pct": -1}
+    if not PARSE_LOGS:
+        # Parsing disabled (historic behavior): mark processed, no parse/ingest.
+        processed.add(msg.id)
+        save_state(processed)
+        clear_failure(msg.id)
+        _cleanup_files(msg.id, target, dest, parse_out)
+        return "ok"
 
-        def progress(cur, total):
-            pct = int(cur * 100 / total) if total else 0
-            if pct >= last["pct"] + 5:
-                last["pct"] = pct
-                log.info("msg %d: %d%% (%.1f/%.1f MB)", msg.id, pct, cur / 1e6, total / 1e6)
+    try:
+        # ---- step: extract-or-download --------------------------------
+        total_bytes, _nfiles = _dir_metrics(dest) if dest.exists() else (0, 0)
+        if dest.exists() and any(dest.rglob("*")) and total_bytes > 0:
+            log.info(
+                "msg %d: extracted dir already exists at %s (%.1f MB) - resuming after extraction",
+                msg.id,
+                dest,
+                total_bytes / 1e6,
+            )
+        else:
+            # A dest dir of empty files is extraction garbage (7z leaves empty
+            # placeholders when the password is wrong) - remove it.
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+                log.info("msg %d: removed empty/garbage extraction dir %s", msg.id, dest)
+            expected = source.document.size or 0
+            if target.exists() and expected and target.stat().st_size == expected:
+                log.info(
+                    "msg %d: archive already on disk (size verified) - retrying extraction",
+                    msg.id,
+                )
+            else:
+                if target.exists():
+                    # no usable dest dir -> whatever archive file is on disk is
+                    # partial (restart mid-download); re-download from scratch.
+                    target.unlink()
+                needed = (source.document.size or 0) * DISK_SIZE_MULTIPLIER + MIN_FREE_GB * 1024**3
+                if _free_bytes(DOWNLOAD_DIR) < needed:
+                    freed = cleanup_ingested_leftovers(processed)
+                    if freed:
+                        log.info(
+                            "msg %d: disk guard freed %.1f GB of already-ingested leftovers",
+                            msg.id,
+                            freed / 1e9,
+                        )
+                    if _free_bytes(DOWNLOAD_DIR) < needed:
+                        log.error(
+                            "msg %d: low disk (%.1f GB free, need ~%.1f GB) - leaving pending",
+                            msg.id,
+                            _free_bytes(DOWNLOAD_DIR) / 1e9,
+                            needed / 1e9,
+                        )
+                        return "pending"
+                size_mb = (source.document.size or 0) / 1e6
+                log.info("msg %d: downloading %s (%.1f MB)", msg.id, fname, size_mb)
+                last = {"pct": -1}
 
-        downloaded = await client.download_media(source, file=str(target), progress_callback=progress)
-        if not downloaded or not target.exists() or target.stat().st_size == 0:
+                def progress(cur, total):
+                    pct = int(cur * 100 / total) if total else 0
+                    if pct >= last["pct"] + 5:
+                        last["pct"] = pct
+                        heartbeat("download", msg.id, f"{pct}%")
+                        log.info(
+                            "msg %d: %d%% (%.1f/%.1f MB)", msg.id, pct, cur / 1e6, total / 1e6
+                        )
+
+                downloaded = await client.download_media(
+                    source, file=str(target), progress_callback=progress
+                )
+                # ---- verify: exact size ----------------------------------
+                if not downloaded or not target.exists() or target.stat().st_size == 0:
+                    target.unlink(missing_ok=True)
+                    raise PipelineError("Telegram did not return file data")
+                if expected and target.stat().st_size != expected:
+                    actual = target.stat().st_size
+                    target.unlink(missing_ok=True)
+                    raise PipelineError(
+                        f"download incomplete: {actual}/{expected} bytes"
+                    )
+
+            # ---- step: extract -----------------------------------------
+            heartbeat("extract", msg.id, fname)
+            try:
+                extract_archive(target, candidates, dest)
+            except Exception as e:
+                # 7z leaves empty placeholder files when the password is
+                # wrong - scrub them so a later resume can't mistake the
+                # garbage for a valid extraction. The archive itself is kept
+                # for a cheap extraction retry, unless disk is tight.
+                shutil.rmtree(dest, ignore_errors=True)
+                if _free_bytes(DOWNLOAD_DIR) < KEEP_ARCHIVE_MIN_FREE_GB * 1024**3:
+                    target.unlink(missing_ok=True)
+                    log.info(
+                        "msg %d: low disk - dropped failed archive %s (will "
+                        "re-download if a retry is attempted)",
+                        msg.id,
+                        target.name,
+                    )
+                raise PipelineError(f"extraction:{e}", counted=True) from e
+            # ---- verify: non-empty extraction -------------------------
+            got_bytes, _f = _dir_metrics(dest)
+            if got_bytes == 0:
+                shutil.rmtree(dest, ignore_errors=True)
+                raise PipelineError("extraction produced no data", counted=True)
+            log.info(
+                "msg %d: extracted %s (pw ok, %.1f MB) -> %s",
+                msg.id,
+                fname,
+                got_bytes / 1e6,
+                dest,
+            )
             target.unlink(missing_ok=True)
-            log.error("msg %d: Telegram did not return file data; leaving it pending for retry", msg.id)
-            return
 
+        # ---- step: parse (verified) --------------------------------
+        heartbeat("parse", msg.id)
+        if not await _parse_and_verify(msg.id, dest, parse_out):
+            raise PipelineError("log parsing produced no usable output", counted=True)
+
+        # ---- step: aggregate + upload + ingest ---------------------
+        heartbeat("ingest", msg.id)
+        aggregate_outputs(msg.id, parse_out)
+        upload_outputs(msg.id, parse_out)
         try:
-            used = extract_archive(target, candidates, dest)
-        except Exception as e:
-            log.error("msg %d: extraction failed (%s). Archive kept at: %s (attempt %d/%d)",
-                      msg.id, e, target,
-                      _failures.get(str(msg.id), {}).get("count", 0) + 1, MAX_RETRIES)
-            if record_failure(msg.id, f"extraction:{e}"):
-                log.warning("msg %d: abandoning after %d extraction failures - marked processed", msg.id, MAX_RETRIES)
+            n = ingest_records(msg.id, parse_out)
+        except Exception as exc:
+            raise PipelineError(f"DB ingestion failed: {exc}") from exc
+        log.info("msg %d: ingested %d credentials into SQLite DB", msg.id, n)
+
+        # ---- step: finalize (only after verified ingestion) ---------
+        heartbeat("finalize", msg.id)
+        processed.add(msg.id)
+        save_state(processed)
+        clear_failure(msg.id)
+        _cleanup_files(msg.id, dest, parse_out)
+        log.info(
+            "msg %d: pipeline complete (%d more queued)", msg.id, _work.qsize()
+        )
+        heartbeat("idle", 0)
+        return "ok"
+    except PipelineError as e:
+        if e.counted:
+            log.error(
+                "msg %d: %s (attempt %d/%d)",
+                msg.id,
+                e,
+                _failures.get(str(msg.id), {}).get("count", 0) + 1,
+                MAX_RETRIES,
+            )
+            if record_failure(msg.id, str(e)):
+                log.warning(
+                    "msg %d: abandoning after %d failures - marked processed",
+                    msg.id,
+                    MAX_RETRIES,
+                )
                 processed.add(msg.id)
                 save_state(processed)
-                target.unlink(missing_ok=True)
-            return
-        log.info("msg %d: extracted %s (pw ok) -> %s", msg.id, fname, dest)
-        target.unlink(missing_ok=True)
-
-    processed.add(msg.id)
-    save_state(processed)
-    clear_failure(msg.id)
-    parse_out = DOWNLOAD_DIR / f"{msg.id}_{Path(fname).stem}.parsed"
-    schedule_parse(msg.id, dest, parse_out)
+                _cleanup_files(msg.id, target, dest, parse_out)
+                heartbeat("idle", 0)
+                return "abandoned"
+            heartbeat("idle", 0)
+            return "counted"
+        log.error("msg %d: %s - leaving pending for retry (not counted)", msg.id, e)
+        heartbeat("idle", 0)
+        return "pending"
 
 
-async def catch_up(client: TelegramClient, entity, hours: float, processed: set,
-                   bot_lock: asyncio.Lock, label: str) -> None:
+async def process_message(
+    client: TelegramClient, msg, processed: set, bot_lock: asyncio.Lock
+) -> None:
+    """Queue-facing wrapper: guarantees the heartbeat returns to idle when
+    this message leaves the pipeline (success, failure, or early pending)."""
+    if msg.id in processed:
+        return "skip"
+    try:
+        return await _process_message_impl(client, msg, processed, bot_lock)
+    finally:
+        heartbeat("idle", 0)
+
+
+async def catch_up(
+    client: TelegramClient,
+    entity,
+    hours: float,
+    processed: set,
+    bot_lock: asyncio.Lock,
+    label: str,
+) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    log.info("%s: processing posts newer than %s UTC", label, cutoff.strftime("%Y-%m-%d %H:%M"))
+    log.info(
+        "%s: processing posts newer than %s UTC",
+        label,
+        cutoff.strftime("%Y-%m-%d %H:%M"),
+    )
     async for msg in client.iter_messages(entity, offset_date=cutoff, reverse=True):
-        await process_message(client, msg, processed, bot_lock)
-    log.info("%s: done", label)
+        if msg.id in processed:
+            continue
+        if is_candidate(msg):
+            _work.put_nowait(msg)
+    log.info("%s: done - %d msg(s) now queued for the pipeline", label, _work.qsize())
 
 
 async def run(args) -> None:
     if not (API_ID and API_HASH):
-        sys.exit("Set TG_API_ID / TG_API_HASH in .env (get them from https://my.telegram.org). See README.")
+        sys.exit(
+            "Set TG_API_ID / TG_API_HASH in .env (get them from https://my.telegram.org). See README."
+        )
     if not CHANNEL:
-        sys.exit("Set CHANNEL in .env (e.g. @channelname, https://t.me/channelname, or numeric id).")
+        sys.exit(
+            "Set CHANNEL in .env (e.g. @channelname, https://t.me/channelname, or numeric id)."
+        )
     session = StringSession(SESSION_STRING) if SESSION_STRING else SESSION_FILE
     client = TelegramClient(session, int(API_ID), API_HASH)
     await client.connect()
@@ -562,9 +1027,26 @@ async def run(args) -> None:
     load_failures()
     bot_lock = asyncio.Lock()
     fresh = not STATE_FILE.exists()
+    _scrub_partials()
+    freed = cleanup_ingested_leftovers(processed)
+    if freed:
+        log.info(
+            "startup: cleaned %.1f GB of already-ingested download leftovers",
+            freed / 1e9,
+        )
     log.info("watching channel: %s | downloads -> %s", title, DOWNLOAD_DIR.resolve())
 
-    backfill = args.backfill_hours if args.backfill_hours is not None else (BACKFILL_HOURS if fresh else 0)
+    # Serial pipeline worker: exactly one archive in flight at any time.
+    worker_task = asyncio.get_running_loop().create_task(
+        _pipeline_worker(client, processed, bot_lock)
+    )
+    log.info("pipeline: serial worker started (download -> extract -> parse -> ingest -> delete)")
+
+    backfill = (
+        args.backfill_hours
+        if args.backfill_hours is not None
+        else (BACKFILL_HOURS if fresh else 0)
+    )
     if backfill > 0:
         await catch_up(client, entity, backfill, processed, bot_lock, "backfill")
 
@@ -575,16 +1057,17 @@ async def run(args) -> None:
     @client.on(events.NewMessage(chats=entity))
     @client.on(events.MessageEdited(chats=entity))
     async def on_message(event):
-        await process_message(client, event.message, processed, bot_lock)
+        # Live posts only enqueue; the serial worker picks them up in order -
+        # no concurrent processing with the sweep or each other.
+        if is_candidate(event.message) and event.message.id not in processed:
+            _work.put_nowait(event.message)
+            log.info("live: queued msg %d (%d queued)", event.message.id, _work.qsize())
 
     log.info("live: waiting for new or edited posts (Ctrl+C to stop)")
     try:
         await client.run_until_disconnected()
     finally:
-        if _parse_tasks:
-            pending = tuple(_parse_tasks)
-            log.info("waiting for %d background parse task(s) to finish...", len(pending))
-            await asyncio.gather(*pending, return_exceptions=True)
+        worker_task.cancel()
 
 
 def main() -> None:
@@ -595,10 +1078,18 @@ def main() -> None:
         stream=sys.stdout,
     )
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backfill-hours", type=float, default=None,
-                    help="once: process posts from the last N hours (0=off; default: 24 on first run only)")
-    ap.add_argument("--sweep-hours", type=float, default=None,
-                    help="catch-up window checked on every start (default: 2)")
+    ap.add_argument(
+        "--backfill-hours",
+        type=float,
+        default=None,
+        help="once: process posts from the last N hours (0=off; default: 24 on first run only)",
+    )
+    ap.add_argument(
+        "--sweep-hours",
+        type=float,
+        default=None,
+        help="catch-up window checked on every start (default: 2)",
+    )
     args = ap.parse_args()
     try:
         asyncio.run(run(args))
