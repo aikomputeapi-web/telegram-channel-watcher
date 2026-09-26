@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,6 +63,10 @@ DOWNLOAD_BOTS = {
 }
 BOT_RESPONSE_TIMEOUT = float(os.getenv("BOT_RESPONSE_TIMEOUT", "120"))
 PARSE_LOGS = os.getenv("PARSE_LOGS", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Run each parse batch in a subprocess (python -m stealer_log_parser) so its
+# memory is freed to the OS between batches. Required on small-RAM VPSes:
+# in-process parsing of 30k-file batches OOM-kills a 2GB box.
+PARSE_SUBPROCESS = os.getenv("PARSE_SUBPROCESS", "0").strip().lower() in {"1", "true", "yes", "on"}
 PARSER_REDACTION = os.getenv("PARSER_REDACTION", "none")
 PARSER_FAMILY = os.getenv("PARSER_FAMILY", "auto")
 PARSE_MAX_TOTAL_MB = float(os.getenv("PARSE_MAX_TOTAL_MB", "6144"))
@@ -208,6 +213,58 @@ def _dir_metrics(root: Path) -> tuple[int, int]:
     return total, count
 
 
+def _run_parser_cli(batch: list[Path], out_dir: Path) -> dict | None:
+    """Parse one batch via the parser CLI as a subprocess. Memory is freed to
+    the OS when the process exits, preventing OOM on small-RAM VPSes. The
+    summary is read back from the atomic manifest.json the parser writes
+    last. Returns None only if the subprocess failed to start."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "stealer_log_parser",
+        "parse",
+        *[str(p) for p in batch],
+        "--output",
+        str(out_dir),
+        "--redaction",
+        PARSER_REDACTION,
+        "--family",
+        PARSER_FAMILY,
+        "--overwrite",
+        "--allow-insecure-permissions",
+        "--quiet",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=14 * 3600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("parser subprocess failed to run: %s", e)
+        return None
+    manifest = out_dir / "manifest.json"
+    if not manifest.is_file():
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        log.warning("parser subprocess produced no manifest (rc=%s): %s", proc.returncode, tail)
+        return None
+    try:
+        m = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("manifest.json unreadable: %s", e)
+        return None
+    counts = m.get("diagnostic_counts") or {}
+    # Manifest has no exit code and no recoverable/unrecoverable breakdown, so
+    # treat status == "failed" (or a zero-record run) as fatal; otherwise the
+    # outputs count as usable - archive-safety 'error' diagnostics on cache
+    # blobs still leave valid records behind, and garbage is filtered at ingest.
+    fatal = m.get("status") == "failed" or m.get("record_count", 0) == 0
+    return {
+        "record_count": m.get("record_count", 0),
+        "accepted_files": m.get("accepted_virtual_files", 0),
+        "skipped_files": m.get("skipped_virtual_files", 0),
+        "exit_code": 3 if fatal else 0,
+        "family": (m.get("family") or {}).get("selected", "unknown"),
+        "family_score": (m.get("family") or {}).get("score", 0.0),
+    }
+
+
 def _parse_batches(source_dir: Path) -> list[list[Path]]:
     """Split `source_dir` into size-bounded batches of its children.
     Oversized extractions (stealer dumps grouped in per-machine folders) are
@@ -315,15 +372,19 @@ async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> 
             if len(batch) > 3:
                 label += f", ... ({len(batch)} items)"
             log.info(
-                "msg %d: parsing batch %d/%d (%s)...", msg_id, i, len(batches), label
+                "msg %d: parsing batch %d/%d (%s)%s...", msg_id, i, len(batches), label,
+                " [subprocess]" if PARSE_SUBPROCESS else "",
             )
-            result = await asyncio.to_thread(
-                parse_extracted_dirs,
-                batch,
-                batch_out,
-                redaction=PARSER_REDACTION,
-                family=PARSER_FAMILY,
-            )
+            if PARSE_SUBPROCESS:
+                result = await asyncio.to_thread(_run_parser_cli, batch, batch_out)
+            else:
+                result = await asyncio.to_thread(
+                    parse_extracted_dirs,
+                    batch,
+                    batch_out,
+                    redaction=PARSER_REDACTION,
+                    family=PARSER_FAMILY,
+                )
             if result is None and not _usable(batch_out):
                 log.warning(
                     "msg %d: batch %d/%d parsing failed (parser not installed or errored)",
