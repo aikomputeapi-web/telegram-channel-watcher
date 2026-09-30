@@ -565,6 +565,39 @@ def upload_outputs(msg_id: int, output_dir: Path) -> None:
         _upload_to_drive(msg_id, output_dir)
 
 
+def quarantine_failed_items(msg_id: int) -> None:
+    """Pipeline step: move items whose parsing permanently failed into
+    downloads/_quarantine/msg<id>/ (preserved for offline inspection) instead
+    of deleting them together with the extraction in _cleanup_files."""
+    failed = _LAST_PARSE_FAILED.pop(msg_id, [])
+    if not failed:
+        return
+    qroot = DOWNLOAD_DIR / "_quarantine" / f"msg{msg_id}"
+    qroot.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for raw in failed:
+        p = Path(raw)
+        try:
+            if not p.exists():
+                continue
+            dest = qroot / p.name
+            base = dest
+            n = 1
+            while dest.exists():
+                dest = base.with_name(f"{base.name}.{n}")
+                n += 1
+            shutil.move(str(p), str(dest))
+            moved += 1
+        except OSError as exc:
+            log.warning("msg %d: quarantine move failed for %s: %s", msg_id, p, exc)
+    log.warning(
+        "msg %d: quarantined %d unparseable item(s) under %s",
+        msg_id,
+        moved,
+        qroot,
+    )
+
+
 def _cleanup_files(msg_id: int, *paths: Path) -> None:
     """Pipeline step: delete files after successful ingestion; verify removal."""
     for d in paths:
