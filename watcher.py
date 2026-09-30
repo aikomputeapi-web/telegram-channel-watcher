@@ -73,6 +73,21 @@ PARSE_MAX_TOTAL_MB = float(os.getenv("PARSE_MAX_TOTAL_MB", "6144"))
 PARSE_MAX_FILES = int(os.getenv("PARSE_MAX_FILES", "300000"))
 PARSE_BATCH_MB = float(os.getenv("PARSE_BATCH_MB", "512"))
 PARSE_BATCH_FILES = int(os.getenv("PARSE_BATCH_FILES", "4000"))
+# Cap on the parser subprocess's address space (MB, posix only). A batch that
+# needs more fails with a clean MemoryError (manifest-less exit) instead of
+# being killed by the kernel OOM killer - which used to take down the whole
+# watcher unit mid-run (systemd oom-kill restart loop).
+PARSE_SUBPROCESS_RSS_MB = float(os.getenv("PARSE_SUBPROCESS_RSS_MB", "1200"))
+# A failed batch is re-split into 4x smaller groups per retry level, down to
+# these floors, before its items are recorded as unparseable and quarantined.
+PARSE_MIN_SUBBATCH_MB = float(os.getenv("PARSE_MIN_SUBBATCH_MB", "16"))
+PARSE_MIN_SUBBATCH_FILES = int(os.getenv("PARSE_MIN_SUBBATCH_FILES", "64"))
+# Safety cap on total parse batch attempts (incl. re-splits) per message.
+PARSE_MAX_ATTEMPTS = int(os.getenv("PARSE_MAX_ATTEMPTS", "400"))
+# Items (dirs/files) whose parsing permanently failed for the last processed
+# message; consumed by the pipeline step after parse so they can be moved to
+# downloads/_quarantine/msg<id>/ instead of being deleted with the extraction.
+_LAST_PARSE_FAILED: dict[int, list[str]] = {}
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "").strip()
 GDRIVE_FOLDER = os.getenv("GDRIVE_FOLDER", "telegram-watcher").strip()
 UPLOAD_URL = os.getenv("UPLOAD_URL", "").strip().rstrip("/")
@@ -213,11 +228,17 @@ def _dir_metrics(root: Path) -> tuple[int, int]:
     return total, count
 
 
+_BASH_BIN = shutil.which("bash") or ""
+
+
 def _run_parser_cli(batch: list[Path], out_dir: Path) -> dict | None:
     """Parse one batch via the parser CLI as a subprocess. Memory is freed to
     the OS when the process exits, preventing OOM on small-RAM VPSes. The
-    summary is read back from the atomic manifest.json the parser writes
-    last. Returns None only if the subprocess failed to start."""
+    subprocess's address space is capped via ulimit (PARSE_SUBPROCESS_RSS_MB)
+    so an oversized batch dies with a clean MemoryError instead of dragging
+    the whole watcher unit into the kernel OOM killer. The summary is read
+    back from the atomic manifest.json the parser writes last. Returns None
+    only if the subprocess failed to start."""
     cmd = [
         sys.executable,
         "-m",
@@ -234,6 +255,14 @@ def _run_parser_cli(batch: list[Path], out_dir: Path) -> dict | None:
         "--allow-insecure-permissions",
         "--quiet",
     ]
+    if os.name == "posix" and PARSE_SUBPROCESS_RSS_MB > 0 and _BASH_BIN:
+        cmd = [
+            _BASH_BIN,
+            "-c",
+            f"ulimit -v {int(PARSE_SUBPROCESS_RSS_MB * 1024)}; exec \"$@\"",
+            "--",
+            *cmd,
+        ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=14 * 3600)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -265,6 +294,64 @@ def _run_parser_cli(batch: list[Path], out_dir: Path) -> dict | None:
     }
 
 
+def _pack_batches(
+    items: list[Path], *, batch_mb: float, batch_files: int
+) -> list[list[Path]]:
+    """Greedy-pick `items` (dirs or files) into size-bounded batches."""
+    batch_bytes = batch_mb * 1024 * 1024
+    batches: list[list[Path]] = []
+    current: list[Path] = []
+    current_bytes = 0
+    current_files = 0
+    for item in items:
+        if item.is_dir():
+            total, count = _dir_metrics(item)
+        else:
+            try:
+                total, count = item.stat().st_size, 1
+            except OSError:
+                continue
+        if total > PARSE_MAX_TOTAL_MB * 1024 * 1024 or count > PARSE_MAX_FILES:
+            log.warning(
+                "parsing: item %s (%.1f MB / %d files) exceeds PARSE_MAX_*; skipping it",
+                item.name,
+                total / 1e6,
+                count,
+            )
+            continue
+        if current and (
+            current_bytes + total > batch_bytes
+            or current_files + count > batch_files
+        ):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+            current_files = 0
+        current.append(item)
+        current_bytes += total
+        current_files += count
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _re_split_items(batch: list[Path], depth: int) -> list[list[Path]]:
+    """Split a failed batch into ~4x smaller groups for the next retry."""
+    divisor = 4 ** (depth + 1)
+    sub_mb = max(PARSE_MIN_SUBBATCH_MB, PARSE_BATCH_MB / divisor)
+    sub_files = max(PARSE_MIN_SUBBATCH_FILES, PARSE_BATCH_FILES // divisor)
+    if len(batch) == 1:
+        # One dir left and it still fails: split at file level.
+        p = batch[0]
+        if not p.is_dir():
+            return []
+        files = sorted(x for x in p.rglob("*") if x.is_file())
+        if not files:
+            return []
+        return _pack_batches(files, batch_mb=sub_mb, batch_files=sub_files)
+    return _pack_batches(batch, batch_mb=sub_mb, batch_files=sub_files)
+
+
 def _parse_batches(source_dir: Path) -> list[list[Path]]:
     """Split `source_dir` into size-bounded batches of its children.
     Oversized extractions (stealer dumps grouped in per-machine folders) are
@@ -282,35 +369,9 @@ def _parse_batches(source_dir: Path) -> list[list[Path]]:
     dirs = sorted(p for p in root.iterdir() if p.is_dir())
     if not dirs:
         return [[root]]
-
-    batch_bytes = PARSE_BATCH_MB * 1024 * 1024
-    batches: list[list[Path]] = []
-    current: list[Path] = []
-    current_bytes = 0
-    current_files = 0
-    for d in dirs:
-        total, count = _dir_metrics(d)
-        if total > PARSE_MAX_TOTAL_MB * 1024 * 1024 or count > PARSE_MAX_FILES:
-            log.warning(
-                "parsing %s: subdir %.1f MB / %d files exceeds PARSE_MAX_*; skipping it",
-                d.name,
-                total / 1e6,
-                count,
-            )
-            continue
-        if current and (
-            current_bytes + total > batch_bytes
-            or current_files + count > PARSE_BATCH_FILES
-        ):
-            batches.append(current)
-            current = []
-            current_bytes = 0
-            current_files = 0
-        current.append(d)
-        current_bytes += total
-        current_files += count
-    if current:
-        batches.append(current)
+    batches = _pack_batches(
+        dirs, batch_mb=PARSE_BATCH_MB, batch_files=PARSE_BATCH_FILES
+    )
     if not batches:
         return [[root]]
     return batches
@@ -358,21 +419,45 @@ async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> 
             return False
 
     async with _parse_lock:
-        for i, batch in enumerate(batches, start=1):
-            heartbeat("parse", msg_id, f"batch {i}/{len(batches)}")
-            if len(batches) > 1:
-                batch_out = output_dir / f"part-{i:03d}"
-            else:
-                batch_out = output_dir
+        attempts = 0
+        # Work queue of (depth, batch, out_name). Failed batches are re-split
+        # into 4x smaller groups (deeper levels split single dirs at file
+        # level); anything still unparseable is recorded for quarantine.
+        level: list[tuple[int, list[Path], str]] = [
+            (0, batch, f"part-{i:03d}") for i, batch in enumerate(batches, start=1)
+        ]
+        idx = 0
+        while idx < len(level):
+            depth, batch, out_name = level[idx]
+            idx += 1
+            attempts += 1
+            if attempts > PARSE_MAX_ATTEMPTS:
+                log.warning(
+                    "msg %d: parse attempt budget exhausted - quarantining %d item(s)",
+                    msg_id,
+                    len(batch),
+                )
+                _LAST_PARSE_FAILED.setdefault(msg_id, []).extend(
+                    str(p) for p in batch
+                )
+                continue
+            batch_out = (
+                output_dir / out_name
+                if len(batches) > 1 or depth > 0
+                else output_dir
+            )
             if _usable(batch_out):
-                log.info("msg %d: batch %d/%d already parsed - skipping", msg_id, i, len(batches))
+                log.info("msg %d: batch %s already parsed - skipping", msg_id, out_name)
                 ok = True
                 continue
             label = ", ".join(p.name for p in batch[:3])
             if len(batch) > 3:
                 label += f", ... ({len(batch)} items)"
             log.info(
-                "msg %d: parsing batch %d/%d (%s)%s...", msg_id, i, len(batches), label,
+                "msg %d: parsing batch %s (%s)%s...",
+                msg_id,
+                out_name,
+                label,
                 " [subprocess]" if PARSE_SUBPROCESS else "",
             )
             if PARSE_SUBPROCESS:
@@ -385,14 +470,6 @@ async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> 
                     redaction=PARSER_REDACTION,
                     family=PARSER_FAMILY,
                 )
-            if result is None and not _usable(batch_out):
-                log.warning(
-                    "msg %d: batch %d/%d parsing failed (parser not installed or errored)",
-                    msg_id,
-                    i,
-                    len(batches),
-                )
-                continue
             if result is not None:
                 grand["record_count"] += result.get("record_count", 0)
                 grand["accepted_files"] += result.get("accepted_files", 0)
@@ -407,20 +484,45 @@ async def _parse_and_verify(msg_id: int, source_dir: Path, output_dir: Path) -> 
                 if result is not None and result.get("exit_code", 0) != 0:
                     extra += f"(exit {result['exit_code']} - still accepted by artifacts)"
                 log.info(
-                    "msg %d: batch %d/%d parsed %s-> %s",
+                    "msg %d: batch %s parsed %s-> %s",
                     msg_id,
-                    i,
-                    len(batches),
+                    out_name,
                     extra,
                     batch_out.name,
                 )
-            elif result is not None:
+                continue
+            if result is None:
+                reason = "no manifest (OOM-capped or errored)"
+            else:
+                reason = f"exit code {result['exit_code']}"
+            subs = _re_split_items(batch, depth) if depth < 3 else []
+            if subs:
+                if len(batch) == 1:
+                    reason_note = "retrying as file-level pack(s)"
+                else:
+                    reason_note = "re-splitting into sub-batches"
                 log.warning(
-                    "msg %d: batch %d/%d exit code %d with no usable output (see diagnostics.jsonl)",
+                    "msg %d: batch %s failed (%s) - %s: %d pack(s)",
                     msg_id,
-                    i,
-                    len(batches),
-                    result["exit_code"],
+                    out_name,
+                    reason,
+                    reason_note,
+                    len(subs),
+                )
+                level[idx:idx] = [
+                    (depth + 1, sub, f"{out_name}.{j:03d}")
+                    for j, sub in enumerate(subs, start=1)
+                ]
+            else:
+                log.error(
+                    "msg %d: batch %s unparseable (%s) - quarantining %d item(s)",
+                    msg_id,
+                    out_name,
+                    reason,
+                    len(batch),
+                )
+                _LAST_PARSE_FAILED.setdefault(msg_id, []).extend(
+                    str(p) for p in batch
                 )
     if ok and len(batches) > 1:
         log.info(
@@ -990,6 +1092,7 @@ async def _process_message_impl(
 
         # ---- step: aggregate + upload + ingest ---------------------
         heartbeat("ingest", msg.id)
+        quarantine_failed_items(msg.id)
         aggregate_outputs(msg.id, parse_out)
         upload_outputs(msg.id, parse_out)
         try:
