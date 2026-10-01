@@ -14,40 +14,52 @@ def message_with_url(url: str):
     return SimpleNamespace(buttons=[[button]])
 
 
-class FakeConversation:
-    def __init__(self):
-        self.sent = []
-        self.responses = [SimpleNamespace(document=None), SimpleNamespace(document=object())]
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-    async def send_message(self, text: str):
-        self.sent.append(text)
-
-    async def get_response(self):
-        return self.responses.pop(0)
-
-
 class FakeClient:
-    def __init__(self):
-        self.conv = FakeConversation()
-        self.requested_bot = None
+    """Fake matching the event-catcher flow: registers handlers, sends the
+    /start, and delivers queued fake bot messages."""
 
-    def conversation(self, bot, **kwargs):
-        self.requested_bot = bot
-        return self.conv
+    def __init__(self):
+        self.handlers = []
+        self.sent = []
+        self.forwarded = []
+        self.queue_task = None
+
+    def add_event_handler(self, cb, evt=None):
+        self.handlers.append(cb)
+
+    def remove_event_handler(self, cb, evt=None):
+        if cb in self.handlers:
+            self.handlers.remove(cb)
+
+    async def send_message(self, ent, text):
+        self.sent.append(text)
+        # deliver two fake bot replies: a service note, then the file message
+        for msg in self._responses:
+            await asyncio.sleep(0.01)
+            cb = self.handlers[-1]
+            cb(SimpleNamespace(message=msg))
+
+    async def forward_messages(self, dest, msg, silent=False):
+        self.forwarded.append(msg)
+        return SimpleNamespace(id=999, media=msg.media)
+
+    async def get_entity(self, bot):
+        return f"entity:{bot}"
+
+    _responses = [
+        SimpleNamespace(document=None, media=None, message="please wait..."),
+        SimpleNamespace(document=object(), media=object(), message="here is your file"),
+    ]
 
 
 async def test_bot_request() -> None:
     client = FakeClient()
     response = await request_bot_document(client, "boxedrobot", "MTg2NA==", asyncio.Lock())
-    assert client.requested_bot == "boxedrobot"
-    assert client.conv.sent == ["/start MTg2NA=="]
-    assert response.document is not None
+    assert client.sent == ["/start MTg2NA=="], client.sent
+    assert len(client.forwarded) == 1, "file message was not forwarded to Saved Messages"
+    assert response.media is not None, "returned the durable Saved copy"
+    # handler must be unregistered after the request completes
+    assert not client.handlers, "event handler leaked"
 
 
 def main() -> None:

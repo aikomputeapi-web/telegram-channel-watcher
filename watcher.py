@@ -899,22 +899,74 @@ def bot_deep_link(msg):
 async def request_bot_document(
     client: TelegramClient, bot: str, payload: str, lock: asyncio.Lock
 ):
+    """Ask @bot for the archive and catch its response message.
+
+    The bot sends the file as a message that SELF-DESTRUCTS (~15s), possibly
+    forwarded from the channel or with an unusual sender, so a plain
+    conversation() read (which filters by sender) can miss it. Instead:
+
+    1. Register a raw incoming-message listener on the bot dialog FIRST
+       (any sender, any media type - forwards included).
+    2. Send /start <payload>.
+    3. On the first caught message: IMMEDIATELY forward it to Saved Messages
+       so it survives the self-destruct timer, then return the original.
+    4. The caller downloads from the Saved-Messages copy (message.fwd_from
+       carries the media; Telethon can download from a forwarded message).
+    """
     log.info("requesting file from @%s", bot)
-    async with lock:
-        deadline = monotonic() + BOT_RESPONSE_TIMEOUT
-        async with client.conversation(
-            bot, timeout=BOT_RESPONSE_TIMEOUT, exclusive=True
-        ) as conv:
-            await conv.send_message(f"/start {payload}")
+    bot_ent = await client.get_entity(bot)
+    caught: asyncio.Queue = asyncio.Queue()
+
+    def _on_evt(event):
+        caught.put_nowait(event.message)
+
+    client.add_event_handler(_on_evt, events.NewMessage(chats=[bot_ent], incoming=True))
+    try:
+        async with lock:
+            deadline = monotonic() + BOT_RESPONSE_TIMEOUT
+            await client.send_message(bot_ent, f"/start {payload}")
             while True:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                response = await asyncio.wait_for(
-                    conv.get_response(), timeout=remaining
+                try:
+                    response = await asyncio.wait_for(caught.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise asyncio.TimeoutError(
+                        f"no message from @bot within {BOT_RESPONSE_TIMEOUT}s"
+                    ) from None
+                # accept anything with media/document; forwards may carry media
+                # under message.fwd_from with media attached to the forward
+                if response.document or response.media:
+                    # SURVIVAL FIRST: forward to Saved Messages before the
+                    # ~15s self-destruct kills it.
+                    try:
+                        saved = await client.forward_messages(
+                            "me", response, silent=True
+                        )
+                        if isinstance(saved, list):
+                            saved = saved[0]
+                        log.info(
+                            "msg from @%s forwarded to Saved Messages (id %s)",
+                            bot,
+                            getattr(saved, "id", "?"),
+                        )
+                        # prefer the durable Saved copy for download
+                        return saved
+                    except Exception as fw_err:
+                        log.warning(
+                            "forward to Saved Messages failed (%s) - using original "
+                            "message and racing the self-destruct timer", fw_err
+                        )
+                        return response
+                # ignore service text replies (e.g. 'please wait') and keep waiting
+                log.info(
+                    "@%s sent a non-media message (%r) - still waiting for the file",
+                    bot,
+                    (response.message or "")[:80],
                 )
-                if response.document:
-                    return response
+    finally:
+        client.remove_event_handler(_on_evt)
 
 
 async def _process_message_impl(
@@ -1140,6 +1192,13 @@ async def _process_message_impl(
         save_state(processed)
         clear_failure(msg.id)
         _cleanup_files(msg.id, dest, parse_out)
+        # The Saved-Messages copy of a bot-fetch document is no longer needed
+        # once the archive is ingested (failures keep it for retries).
+        if deep_link and source is not None and source is not msg:
+            try:
+                await client.delete_messages("me", source.id)
+            except Exception as e:
+                log.warning("msg %d: saved-messages cleanup failed: %s", msg.id, e)
         log.info(
             "msg %d: pipeline complete (%d more queued)", msg.id, _work.qsize()
         )
