@@ -221,27 +221,22 @@ def run(db_path: Path, apply: bool, backup: Path | None, json_out: Path | None) 
     # Phase 2 (write): inserts + deletes per batch, all inside one
     # transaction, only when --apply.
     if apply and insert_batches:
-        changes_before = conn.total_changes
+        writer = conn.cursor()
         conn.execute("BEGIN")
         try:
+            inserted = 0
             for batch, rid in zip(insert_batches, delete_ids):
-                conn.executemany(INSERT_SQL, batch)
-                conn.execute("DELETE FROM credentials WHERE id=?", (rid,))
+                writer.executemany(INSERT_SQL, batch)
+                # rowcount respects INSERT OR IGNORE: skipped dupes don't count.
+                # (conn.total_changes would also count FTS trigger writes, so
+                # it is NOT usable to derive the dedup count here.)
+                inserted += writer.rowcount
+                writer.execute("DELETE FROM credentials WHERE id=?", (rid,))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        changes_after = conn.total_changes
-        stats["trios_already_present"] = stats["trios_to_emit"] - (
-            changes_after - changes_before
-        )
-        # changes include the deletes too; recompute precisely:
-        # inserted = trios_to_emit - already_present - deletes? No:
-        # total_changes counts inserted rows AND deleted rows. So:
-        # delta = inserted + deleted -> inserted = delta - len(delete_ids)
-        stats["trios_already_present"] = (
-            stats["trios_to_emit"] - ((changes_after - changes_before) - len(delete_ids))
-        )
+        stats["trios_already_present"] = stats["trios_to_emit"] - inserted
 
     conn.close()
 
