@@ -38,6 +38,21 @@ app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_SECURE"] = True
 
 
+def _fmt_dt(value):
+    """Format a SQLite datetime('now') string (UTC, 'YYYY-MM-DD HH:MM:SS') for
+    display in the results table. Shows 'YYYY-MM-DD HH:MM' with a UTC marker;
+    falls back to the raw value on anything unexpected."""
+    if not value:
+        return "\u2014"
+    text = str(value).strip()
+    if len(text) >= 16 and text[4] == "-" and text[7] == "-":
+        return text[:16] + " UTC"
+    return text
+
+
+app.jinja_env.globals["fmt_dt"] = _fmt_dt
+
+
 @app.after_request
 def _no_cache(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -201,6 +216,7 @@ tr:hover { background: #1c2128; }
 td.domain { color: #58a6ff; font-weight: 500; }
 td.password { color: #f0883e; font-family: monospace; }
 td.username { color: #7ee787; font-family: monospace; }
+td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
 .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
 .pagination a, .pagination span { padding: 6px 12px; border-radius: 4px;
     text-decoration: none; font-size: 14px; }
@@ -274,7 +290,7 @@ td.username { color: #7ee787; font-family: monospace; }
 {% endif %}
 {% if results %}
 <table>
-  <tr><th>#</th><th>Domain</th><th>Username</th><th>Password</th><th>Browser</th><th>Msg</th><th>Source File</th></tr>
+  <tr><th>#</th><th>Domain</th><th>Username</th><th>Password</th><th>Browser</th><th>Msg</th><th>Source File</th><th>Added</th></tr>
   {% for r in results %}
   <tr>
     <td>{{ offset + loop.index }}</td>
@@ -284,6 +300,7 @@ td.username { color: #7ee787; font-family: monospace; }
     <td>{{ r.browser or '—' }}</td>
     <td>{{ r.msg_id }}</td>
     <td style="font-size:11px;color:#8b949e;">{{ (r.source_file or '—')[:50] }}</td>
+    <td class="added" title="{{ r.imported_at or '' }}">{{ fmt_dt(r.imported_at) }}</td>
   </tr>
   {% endfor %}
 </table>
@@ -693,7 +710,7 @@ def download_csv():
     log_search(
         user_id=session.get("user_id", 0),
         username=session.get("user", ""),
-        query=(f"[{field}] {query}" if field else query) + " (CSV)",
+        query=(f"[{field}] {query}" if field else query),
         result_count=total,
         db_path=DB_PATH,
         ip_address=request.headers.get("X-Forwarded-For", request.remote_addr),
@@ -702,7 +719,7 @@ def download_csv():
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["#", "Domain", "Username", "Password", "Browser", "Msg", "Source File"]
+        ["#", "Domain", "Username", "Password", "Browser", "Msg", "Source File", "Added (UTC)"]
     )
     for i, r in enumerate(rows, 1):
         writer.writerow(
@@ -714,6 +731,7 @@ def download_csv():
                 r.get("browser", ""),
                 r["msg_id"],
                 r.get("source_file", ""),
+                r.get("imported_at", ""),
             ]
         )
 
