@@ -41,6 +41,23 @@ app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_SECURE"] = True
 
 
+def _split_query(raw: str, field: str | None) -> tuple[str, str | None]:
+    """Split an optional leading '[field] ' prefix off a query.
+
+    The search log stores 'query' as '[field] term' (and the recent-search chips
+    link back that way), and external callers (credsearch-batch) send it
+    literally. Strip it here so it never reaches FTS as a literal bracket.
+    """
+    text = (raw or "").strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end > 0:
+            candidate = text[1:end].strip()
+            if candidate in {"domain", "username", "password", "origin"}:
+                return text[end + 1 :].strip(), (field or candidate)
+    return text, field
+
+
 def _fmt_dt(value):
     """Format a SQLite datetime('now') string (UTC, 'YYYY-MM-DD HH:MM:SS') for
     display in the results table. Shows 'YYYY-MM-DD HH:MM' with a UTC marker;
@@ -706,8 +723,7 @@ def index():
     from credentials_db import list_search_logs, log_search
     from credentials_db import search as db_search
 
-    query = request.args.get("q", "").strip()
-    field = request.args.get("field", "").strip() or None
+    query, field = _split_query(request.args.get("q", ""), request.args.get("field", "").strip() or None)
     try:
         page = max(1, int(request.args.get("page", 1)))
     except (TypeError, ValueError):
@@ -759,8 +775,7 @@ def download_csv():
     from credentials_db import log_search
     from credentials_db import search as db_search
 
-    query = request.args.get("q", "").strip()
-    field = request.args.get("field", "").strip() or None
+    query, field = _split_query(request.args.get("q", ""), request.args.get("field", "").strip() or None)
     if not query:
         return redirect(url_for("index"))
 

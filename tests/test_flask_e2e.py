@@ -123,6 +123,12 @@ def main() -> None:
         check("field=origin scopes to origin column", "example.org" in body)
         check("field=origin excludes non-path rows", "hunter2" not in body)
 
+        # --- Bracketed field prefix ('[domain] foo') from the search log / external callers ---
+        resp = client.get("/search", query_string={"q": "[domain] gmail"})
+        body = resp.data.decode("utf-8")
+        check("bracketed field prefix is stripped + applied", "gmail.com" in body)
+        check("bracketed prefix does not leak into results count", "No results" not in body)
+
         # --- Search: no results ---
         resp = client.get("/search?q=nonexistent123")
         body = resp.data.decode("utf-8")
