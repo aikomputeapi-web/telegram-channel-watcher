@@ -1,4 +1,5 @@
 """Tests for FTS5 trigram search in credentials_db."""
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -33,9 +34,19 @@ def main() -> None:
         n = ingest_records(100, out_dir, db_path)
         assert n == 4, f"expected 4 rows ingested, got {n}"
 
+        # Rows loaded by credentials_to_db.py carry no origin at all (that is how
+        # 5M+ prod rows ended up with an empty origin), so add one directly and
+        # let the FTS triggers index it.
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO credentials(msg_id, domain, username, password, origin) "
+                "VALUES (101, 'localhost', 'erin', 'nooriginpw', '')"
+            )
+            conn.commit()
+
         # Verify stats.
         s = stats(db_path)
-        assert s["total"] == 4, s
+        assert s["total"] == 5, s
         assert s["domains"] >= 4, s
 
         # ── FTS5 trigram searches ──
@@ -81,9 +92,17 @@ def main() -> None:
         results, total = search(db_path, "github.com/", 100, 0)
         assert total == 1, f"'github.com/' should match 1 row, got {total}"
 
-        # origin search must not leak into other columns.
+        # ── origin search must not leak into other columns.
         results, total = search(db_path, "alice", 100, 0, field="origin")
         assert total == 0, f"origin scope should not match a username, got {total}"
+
+        # A domain-only query must NOT auto-scope to origin — 5M+ prod rows have an
+        # empty origin and only the domain column covers them.
+        results, total = search(db_path, "localhost", 100, 0)
+        assert total == 1, f"bare domain must still match empty-origin rows, got {total}"
+        assert results[0]["origin"] == ""
+        results, total = search(db_path, "localhost", 100, 0, field="origin")
+        assert total == 0, f"explicit origin scope excludes empty origin, got {total}"
 
         # ── Re-init should be idempotent (FTS backfill won't duplicate) ──
         init_db(db_path)

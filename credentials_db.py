@@ -427,13 +427,15 @@ def search(
     return [dict(r) for r in rows], total
 
 
-# A query shaped like "host.tld/path" — the slash only exists in `origin`,
-# so all-fields search routes it to the origin column.
-_DOMAIN_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(/\S*)?$", re.I)
+# A query shaped like "host.tld/path" — the path half only exists in `origin`, so
+# all-fields search routes it to the origin column. A bare domain must NOT be
+# routed: 5M+ rows have an empty origin, and they would be lost (the domain
+# column still covers them).
+_DOMAIN_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}/\S*$", re.I)
 
 
 def _looks_like_domain_path(query: str) -> bool:
-    """True if `query` is a domain optionally followed by a path."""
+    """True if `query` is a domain followed by a '/' path."""
     text = query.strip()
     if not text or text.startswith("http"):
         return False
