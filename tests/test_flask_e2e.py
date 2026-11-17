@@ -108,6 +108,21 @@ def main() -> None:
         body = resp.data.decode("utf-8")
         check("search 'carol' finds username", "carol" in body)
 
+        # --- Search: by URL path (origin column) ---
+        resp = client.get("/search?q=gmail.com/login")
+        body = resp.data.decode("utf-8")
+        check("search 'gmail.com/login' finds URL path", "gmail.com" in body)
+        check("URL path column rendered", "/login" in body)
+
+        resp = client.get("/search?q=%2Fpath")  # /path
+        body = resp.data.decode("utf-8")
+        check("search '/path' finds example.org/path", "example.org" in body)
+
+        resp = client.get("/search?q=example.org%2Fpath&field=origin")
+        body = resp.data.decode("utf-8")
+        check("field=origin scopes to origin column", "example.org" in body)
+        check("field=origin excludes non-path rows", "hunter2" not in body)
+
         # --- Search: no results ---
         resp = client.get("/search?q=nonexistent123")
         body = resp.data.decode("utf-8")

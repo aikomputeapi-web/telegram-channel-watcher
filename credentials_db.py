@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 from pathlib import Path
@@ -91,29 +92,54 @@ CREATE INDEX IF NOT EXISTS idx_search_log_username ON search_log(username);
 """
 
 # FTS5 virtual table with trigram tokenizer for fast substring search.
-# Covers domain, username, password (origin removed — not needed as a search term).
+# Covers domain, username, password, and origin (origin is what carries the
+# URL path, so "github.com/login" is searchable as one substring).
 # Triggers keep the FTS index in sync on INSERT / UPDATE / DELETE.
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS credentials_fts USING fts5(
-    domain, username, password,
+    domain, username, password, origin,
     content='credentials', content_rowid='id',
     tokenize='trigram'
 );
 CREATE TRIGGER IF NOT EXISTS credentials_fts_ai AFTER INSERT ON credentials BEGIN
-    INSERT INTO credentials_fts(rowid, domain, username, password)
-    VALUES (new.id, new.domain, new.username, new.password);
+    INSERT INTO credentials_fts(rowid, domain, username, password, origin)
+    VALUES (new.id, new.domain, new.username, new.password, new.origin);
 END;
 CREATE TRIGGER IF NOT EXISTS credentials_fts_ad AFTER DELETE ON credentials BEGIN
-    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password)
-    VALUES ('delete', old.id, old.domain, old.username, old.password);
+    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password, origin)
+    VALUES ('delete', old.id, old.domain, old.username, old.password, old.origin);
 END;
 CREATE TRIGGER IF NOT EXISTS credentials_fts_au AFTER UPDATE ON credentials BEGIN
-    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password)
-    VALUES ('delete', old.id, old.domain, old.username, old.password);
-    INSERT INTO credentials_fts(rowid, domain, username, password)
-    VALUES (new.id, new.domain, new.username, new.password);
+    INSERT INTO credentials_fts(credentials_fts, rowid, domain, username, password, origin)
+    VALUES ('delete', old.id, old.domain, old.username, old.password, old.origin);
+    INSERT INTO credentials_fts(rowid, domain, username, password, origin)
+    VALUES (new.id, new.domain, new.username, new.password, new.origin);
 END;
 """
+
+# Columns expected in the FTS index. Older DBs indexed only the first three;
+# a missing column means the index must be dropped and rebuilt with origin.
+FTS_COLUMNS = ("domain", "username", "password", "origin")
+
+
+def _fts_needs_rebuild(conn: sqlite3.Connection) -> bool:
+    """True if the FTS table exists but lacks any of FTS_COLUMNS (old schema)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(credentials_fts)")}
+    if not cols:
+        return True
+    return bool(set(FTS_COLUMNS) - cols)
+
+
+def _drop_fts(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS credentials_fts_ai;
+        DROP TRIGGER IF EXISTS credentials_fts_ad;
+        DROP TRIGGER IF EXISTS credentials_fts_au;
+        DROP TABLE IF EXISTS credentials_fts;
+        """
+    )
+
 
 
 def init_db(db_path: Path | None = None, skip_large_rebuild: bool = True) -> None:
@@ -129,6 +155,14 @@ def init_db(db_path: Path | None = None, skip_large_rebuild: bool = True) -> Non
             conn.execute("ALTER TABLE users ADD COLUMN last_login TEXT")
             conn.commit()
             log.info("Migrated users table: added last_login column")
+        # Migration: older FTS schemas indexed only domain/username/password, so
+        # URL paths (stored in `origin`) were unsearchable. Drop the stale table
+        # and recreate it with the origin column; the caller rebuilds the index.
+        stale_fts = _fts_needs_rebuild(conn)
+        if stale_fts:
+            _drop_fts(conn)
+            conn.commit()
+            log.info("Dropped stale FTS index (schema upgrade: +origin column)")
         conn.executescript(FTS_SCHEMA)
         # For external content FTS5 tables, COUNT(*) returns the source row count
         # (not the actual index size), so we check the shadow idx table instead.
@@ -305,18 +339,32 @@ def search(
     offset: int = 0,
     field: str | None = None,
 ) -> tuple[list[dict], int]:
-    """Search credentials by domain, username, or password using FTS5 trigram index.
+    """Search credentials by domain, username, password, or URL path (origin).
     Returns (results, total_count).
-    If `field` is one of 'domain', 'username', 'password', the search is
-    restricted to that column only; otherwise all three columns are searched."""
+    If `field` is one of 'domain', 'username', 'password', 'origin', the search
+    is restricted to that column only; otherwise all four columns are searched.
+    'origin' holds the full URL, so `field=origin` searches URL paths
+    (e.g. 'github.com/login')."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
         return [], 0
     if not query.strip():
         return [], 0
     # Whitelist the column filter — never interpolate raw user input into SQL.
-    valid_fields = {"domain", "username", "password"}
+    valid_fields = {"domain", "username", "password", "origin"}
     field = field if field in valid_fields else None
+    # A bare query matching a URL shape ("host/path") is ambiguous in the
+    # all-fields mode: the domain column holds only the host, so the path half
+    # would never match. Search origin only in that case so "github.com/login"
+    # behaves intuitively instead of returning 0 rows.
+    if field is None and _looks_like_domain_path(query):
+        field = "origin"
+    if field == "origin":
+        # Origins are stored without a trailing slash ("https://github.com"), so a
+        # typed "github.com/" would otherwise match nothing.
+        stripped = query.strip().rstrip("/")
+        if len(stripped) >= 3:
+            query = stripped
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         _apply_pragmas(conn)
@@ -344,7 +392,9 @@ def search(
                 (fts_query, limit, offset),
             ).fetchall()
         else:
-            # Short query: fall back to prefix LIKE on indexed columns (no origin).
+            # Short query: fall back to prefix LIKE on indexed columns.
+            # `origin` is not indexed, so it is only scanned when it is the
+            # explicitly selected field (avoids a full scan on every 1-2 char query).
             pattern = f"{query}%"
             if field:
                 count_row = conn.execute(
@@ -375,6 +425,19 @@ def search(
                     (pattern, pattern, pattern, limit, offset),
                 ).fetchall()
     return [dict(r) for r in rows], total
+
+
+# A query shaped like "host.tld/path" — the slash only exists in `origin`,
+# so all-fields search routes it to the origin column.
+_DOMAIN_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(/\S*)?$", re.I)
+
+
+def _looks_like_domain_path(query: str) -> bool:
+    """True if `query` is a domain optionally followed by a path."""
+    text = query.strip()
+    if not text or text.startswith("http"):
+        return False
+    return bool(_DOMAIN_PATH_RE.match(text))
 
 
 def _fts_escape(query: str) -> str:

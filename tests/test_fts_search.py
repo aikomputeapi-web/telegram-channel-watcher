@@ -69,6 +69,22 @@ def main() -> None:
         results, total = search(db_path, "nonexistent", 100, 0)
         assert total == 0, f"expected 0 matches for 'nonexistent', got {total}"
 
+        # ── URL path search (origin column) ──
+        results, total = search(db_path, "gmail.com/login", 100, 0)
+        assert total == 1, f"'gmail.com/login' should match 1 row, got {total}"
+        assert results[0]["origin"] == "https://gmail.com/login"
+
+        results, total = search(db_path, "/login", 100, 0, field="origin")
+        assert total == 1, f"origin scope '/login' should match 1 row, got {total}"
+
+        # host/path auto-routes to origin in all-fields mode.
+        results, total = search(db_path, "github.com/", 100, 0)
+        assert total == 1, f"'github.com/' should match 1 row, got {total}"
+
+        # origin search must not leak into other columns.
+        results, total = search(db_path, "alice", 100, 0, field="origin")
+        assert total == 0, f"origin scope should not match a username, got {total}"
+
         # ── Re-init should be idempotent (FTS backfill won't duplicate) ──
         init_db(db_path)
         results, total = search(db_path, "mail", 100, 0)
