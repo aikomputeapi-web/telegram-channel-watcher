@@ -104,6 +104,29 @@ def main() -> None:
         results, total = search(db_path, "localhost", 100, 0, field="origin")
         assert total == 0, f"explicit origin scope excludes empty origin, got {total}"
 
+        # ── FTS triggers + count truthfulness on UPDATE/DELETE ──
+        # A MATCH against the raw index returns tombstoned rowids until the next
+        # segment merge, so the COUNT must join `credentials` or it over-reports.
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM credentials WHERE domain='github.com'")
+            conn.commit()
+        rows, total = search(db_path, "github.com", 100, 0)
+        # github.com is gone, but mail.google.com (contains "google.com") is not
+        # matched by "github.com" — so this asserts the deleted rows are fully gone.
+        assert total == 0 or total == len(rows), f"count {total} != rows {len(rows)}"
+        assert not [r for r in rows if r["domain"] == "github.com"], "deleted row still returned"
+        results, total = search(db_path, "/login", 100, 0, field="origin")
+        assert total == len(results), f"count {total} must equal rows {len(results)}"
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "UPDATE credentials SET origin='https://gmail.com/settings' "
+                "WHERE origin='https://gmail.com/login'"
+            )
+            conn.commit()
+        assert search(db_path, "/login", 100, 0, field="origin")[1] == 0, "old path still indexed"
+        assert search(db_path, "/settings", 100, 0, field="origin")[1] == 1, "new path not indexed"
+
         # ── Re-init should be idempotent (FTS backfill won't duplicate) ──
         init_db(db_path)
         results, total = search(db_path, "mail", 100, 0)

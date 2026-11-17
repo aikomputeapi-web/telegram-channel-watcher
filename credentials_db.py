@@ -378,7 +378,14 @@ def search(
             if field:
                 fts_query = f"{field} : {fts_query}"
             count_row = conn.execute(
-                """SELECT COUNT(*) FROM credentials_fts
+                # Join so the count matches the rows query exactly: a MATCH against the
+                # raw index still returns rowids whose credentials row was deleted
+                # (tombstoned entries survive until the next segment merge), which
+                # over-reports the total and produces empty trailing pages.
+                # NOTE: with an aliased FTS table, MATCH must use the table name
+                # (`credentials_fts`), not the alias — `f MATCH ?` is "no such column".
+                """SELECT COUNT(*) FROM credentials_fts f
+                   JOIN credentials c ON c.id = f.rowid
                    WHERE credentials_fts MATCH ?""",
                 (fts_query,),
             ).fetchone()
